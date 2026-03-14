@@ -126,7 +126,13 @@ document.getElementById('loginForm').addEventListener('submit', async e => {
     })
   });
   const data = await res.json();
-  if (res.ok) window.location.href = '/admin/dashboard';
+  if (res.ok) {
+  if (data.role === "superadmin") {
+    window.location.href = "/admin/dashboard";
+  } else {
+    window.location.href = "/admin/panel";
+  }
+}
   else document.getElementById('err').textContent = data.error || 'Login failed';
 });
 </script>
