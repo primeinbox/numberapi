@@ -6,24 +6,24 @@ const jwt = require("jsonwebtoken");
 const axios = require("axios");
 const cookieParser = require("cookie-parser");
 const cors = require("cors");
+const crypto = require("crypto");
+const { imgtotextai } = require('goodai'); 
 
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 app.use(cors());
+const port = process.env.PORT || 3000;
 
 // ─────────────────────────────────────────────
-// API REGISTRY — Future mein bas yahan add karo
+// API REGISTRY
 // ─────────────────────────────────────────────
-// type       : unique key type identifier (stored in DB)
-// label      : display name
-// prefix     : API key prefix
-// route      : public endpoint
-// paramName  : query param name
-// envKey     : process.env key for upstream URL
-// description: shown in admin panel
-// asyncHandler: custom handler (optional, default = simple proxy)
+app.get('/', (req, res) => {
+  res.send(superAdminDashboardHtml());
+});
+
+app.listen(port, () => console.log(`Dashboard running at http://localhost:${port}`));
 
 const API_REGISTRY = [
   {
@@ -48,25 +48,30 @@ const API_REGISTRY = [
   },
   {
     type: "image",
-    label: "Logo/Image Generator",
+    label: "Image Generator",
     prefix: "img_",
     route: "/generate",
     paramName: "prompt",
     envKey: "UPSTREAM_IMAGE_API_URL",
     description: "AI logo & image generation",
     icon: "🎨",
-    asyncGenerate: true, // special two-step flow
+    asyncGenerate: true,
     checkEnvKey: "UPSTREAM_IMAGE_CHECK_URL",
   },
 ];
 
 // ─────────────────────────────────────────────
-// MONGODB SCHEMAS
+// SCHEMAS
 // ─────────────────────────────────────────────
 
 const AdminSchema = new mongoose.Schema({
   username: { type: String, unique: true, required: true },
   password: { type: String, required: true },
+  allowedTypes: {
+    type: [String],
+    enum: [...API_REGISTRY.map((a) => a.type), "all"],
+    default: ["all"],
+  },
   createdAt: { type: Date, default: Date.now },
   createdBy: { type: String, default: "superadmin" },
 });
@@ -88,8 +93,20 @@ const ApiKeySchema = new mongoose.Schema({
   lastUsedAt: { type: Date, default: null },
 });
 
+// Session schema for device tracking
+const SessionSchema = new mongoose.Schema({
+  username: { type: String, required: true },
+  sessionId: { type: String, unique: true, required: true },
+  userAgent: { type: String, default: "" },
+  ip: { type: String, default: "" },
+  createdAt: { type: Date, default: Date.now },
+  lastSeen: { type: Date, default: Date.now },
+  expiresAt: { type: Date, required: true },
+});
+
 const Admin = mongoose.model("Admin", AdminSchema);
 const ApiKey = mongoose.model("ApiKey", ApiKeySchema);
+const Session = mongoose.model("Session", SessionSchema);
 
 // ─────────────────────────────────────────────
 // HELPERS
@@ -98,28 +115,61 @@ const ApiKey = mongoose.model("ApiKey", ApiKeySchema);
 function generateApiKey(type = "number") {
   const api = API_REGISTRY.find((a) => a.type === type);
   const prefix = api ? api.prefix : "ak_";
-  const chars =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
   let key = prefix;
-  for (let i = 0; i < 32; i++)
-    key += chars[Math.floor(Math.random() * chars.length)];
+  for (let i = 0; i < 32; i++) key += chars[Math.floor(Math.random() * chars.length)];
   return key;
 }
 
-function signToken(payload) {
-  return jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: "8h" });
+function signToken(payload, sessionId) {
+  return jwt.sign({ ...payload, sessionId }, process.env.JWT_SECRET, { expiresIn: "8h" });
 }
 
 function isSuperAdmin(username) {
   return username === process.env.SUPER_ADMIN_USERNAME;
 }
 
-function authMiddleware(req, res, next) {
-  const token =
-    req.cookies?.token || req.headers?.authorization?.split(" ")[1];
+function getClientIp(req) {
+  return req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket?.remoteAddress || "unknown";
+}
+
+function parseDevice(ua = "") {
+  if (!ua) return "Unknown Device";
+  if (/mobile/i.test(ua)) return "📱 Mobile";
+  if (/tablet/i.test(ua)) return "📟 Tablet";
+  return "🖥 Desktop";
+}
+
+async function createSession(username, req) {
+  const sessionId = crypto.randomBytes(24).toString("hex");
+  const expiresAt = new Date(Date.now() + 8 * 3600 * 1000);
+  await Session.create({
+    username,
+    sessionId,
+    userAgent: req.headers["user-agent"] || "",
+    ip: getClientIp(req),
+    expiresAt,
+  });
+  return sessionId;
+}
+
+async function touchSession(sessionId) {
+  await Session.findOneAndUpdate({ sessionId }, { lastSeen: new Date() });
+}
+
+async function removeSession(sessionId) {
+  await Session.findOneAndDelete({ sessionId });
+}
+
+async function authMiddleware(req, res, next) {
+  const token = req.cookies?.token || req.headers?.authorization?.split(" ")[1];
   if (!token) return res.status(401).json({ error: "Unauthorized" });
   try {
     req.user = jwt.verify(token, process.env.JWT_SECRET);
+    // Update lastSeen
+    if (req.user.sessionId) {
+      await touchSession(req.user.sessionId);
+    }
     next();
   } catch {
     return res.status(401).json({ error: "Invalid or expired token" });
@@ -137,156 +187,306 @@ async function validateApiKey(apiKey, requiredType) {
   const keyDoc = await ApiKey.findOne({ key: apiKey });
   if (!keyDoc) return { error: "Invalid API key", status: 401 };
   if (!keyDoc.isActive) return { error: "API key is disabled", status: 403 };
-  if (keyDoc.keyType !== requiredType)
-    return {
-      error: `This key is not authorized for ${requiredType} lookups`,
-      status: 403,
-    };
-  if (keyDoc.expiresAt < new Date())
-    return { error: "API key expired", status: 403 };
-  if (keyDoc.usageLimit && keyDoc.usageCount >= keyDoc.usageLimit)
-    return { error: "API key usage limit reached", status: 429 };
+  if (keyDoc.keyType !== requiredType) return { error: `This key is not authorized for ${requiredType} lookups`, status: 403 };
+  if (keyDoc.expiresAt < new Date()) return { error: "API key expired", status: 403 };
+  if (keyDoc.usageLimit && keyDoc.usageCount >= keyDoc.usageLimit) return { error: "API key usage limit reached", status: 429 };
   return { keyDoc };
 }
 
 async function incrementUsage(keyId) {
-  await ApiKey.findByIdAndUpdate(keyId, {
-    $inc: { usageCount: 1 },
-    lastUsedAt: new Date(),
-  });
+  await ApiKey.findByIdAndUpdate(keyId, { $inc: { usageCount: 1 }, lastUsedAt: new Date() });
 }
 
 // ─────────────────────────────────────────────
-// HTML HELPERS
+// DESIGN SYSTEM — Anime Minimalist Dark
 // ─────────────────────────────────────────────
 
 const CSS_VARS = `
-  :root {
-    --bg: #050a14;
-    --surface: #0d1526;
-    --surface2: #131f35;
-    --border: #1e2e4a;
-    --border2: #243450;
-    --accent: #3b82f6;
-    --accent2: #6366f1;
-    --accent3: #06b6d4;
-    --green: #10b981;
-    --red: #ef4444;
-    --yellow: #f59e0b;
-    --text: #e2e8f0;
-    --text2: #94a3b8;
-    --text3: #64748b;
-    --mono: 'JetBrains Mono', 'Fira Code', monospace;
-  }
+:root {
+  --bg: #08090e;
+  --bg1: #0d0f1a;
+  --bg2: #111422;
+  --surface: #13162a;
+  --surface2: #181c30;
+  --border: #1e2340;
+  --border2: #252b4a;
+  --accent: #6c8aff;
+  --accent2: #a78bfa;
+  --accent3: #38d9f5;
+  --green: #3dfaaa;
+  --red: #ff5f7e;
+  --yellow: #ffd166;
+  --pink: #ff6eb4;
+  --text: #e8eaf6;
+  --text2: #8b90b8;
+  --text3: #4a5080;
+  --mono: 'JetBrains Mono', monospace;
+  --sans: 'Sora', sans-serif;
+}
 `;
 
 const BASE_CSS = `
-  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap');
-  *{margin:0;padding:0;box-sizing:border-box}
-  html{scroll-behavior:smooth}
-  body{background:var(--bg);font-family:'Space Grotesk',sans-serif;color:var(--text);min-height:100vh}
-  ::-webkit-scrollbar{width:6px;height:6px}
-  ::-webkit-scrollbar-track{background:var(--surface)}
-  ::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
-  a{color:var(--accent);text-decoration:none}
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Sora:wght@300;400;500;600;700&display=swap');
 
-  /* Topbar */
-  .topbar{background:var(--surface);border-bottom:1px solid var(--border);padding:14px 24px;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:100;backdrop-filter:blur(8px)}
-  .topbar-brand{display:flex;align-items:center;gap:10px}
-  .topbar-brand h1{font-size:1rem;font-weight:700;letter-spacing:-.01em}
-  .topbar-brand .ver{font-size:.7rem;background:var(--border2);color:var(--text2);padding:2px 8px;border-radius:999px;font-family:var(--mono)}
-  .topbar-actions{display:flex;align-items:center;gap:10px}
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{background:var(--bg);font-family:var(--sans);color:var(--text);min-height:100vh;font-size:14px}
 
-  /* Container */
-  .container{max-width:1140px;margin:0 auto;padding:28px 20px}
+body::before{
+  content:'';position:fixed;inset:0;pointer-events:none;z-index:0;
+  background:
+    radial-gradient(ellipse 60% 40% at 80% 0%, rgba(108,138,255,.07) 0%, transparent 60%),
+    radial-gradient(ellipse 40% 30% at 10% 100%, rgba(167,139,250,.05) 0%, transparent 60%);
+}
 
-  /* Cards */
-  .card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:24px;margin-bottom:20px}
-  .card-title{font-size:.95rem;font-weight:600;color:var(--text);margin-bottom:18px;display:flex;align-items:center;gap:8px}
-  .card-title span{font-size:1.1rem}
+::-webkit-scrollbar{width:4px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border2);border-radius:4px}
+a{color:var(--accent);text-decoration:none}
 
-  /* Tabs */
-  .tabs{display:flex;gap:6px;margin-bottom:24px;flex-wrap:wrap}
-  .tab{padding:8px 18px;border-radius:8px;border:1px solid var(--border);background:transparent;color:var(--text2);cursor:pointer;font-size:.875rem;font-family:'Space Grotesk',sans-serif;font-weight:500;transition:all .2s}
-  .tab:hover{border-color:var(--border2);color:var(--text)}
-  .tab.active{background:var(--accent);border-color:var(--accent);color:#fff}
-  .panel{display:none}.panel.active{display:block}
+/* TOPBAR */
+.topbar{
+  background:rgba(13,15,26,.85);
+  border-bottom:1px solid var(--border);
+  padding:0 28px;height:56px;
+  display:flex;align-items:center;justify-content:space-between;
+  position:sticky;top:0;z-index:100;
+  backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
+}
+.topbar-brand{display:flex;align-items:center;gap:12px}
+.brand-mark{
+  width:30px;height:30px;
+  background:linear-gradient(135deg,var(--accent),var(--accent2));
+  border-radius:8px;display:flex;align-items:center;justify-content:center;
+  font-size:14px;font-weight:700;color:#fff;letter-spacing:-.5px;
+  box-shadow:0 0 20px rgba(108,138,255,.3);
+}
+.brand-name{font-size:.9rem;font-weight:700;letter-spacing:.1em;color:var(--text);text-transform:uppercase}
+.brand-tag{
+  font-size:.6rem;font-family:var(--mono);
+  background:var(--surface2);color:var(--text3);
+  padding:2px 8px;border-radius:99px;border:1px solid var(--border);
+  letter-spacing:.1em;text-transform:uppercase;
+}
+.topbar-right{display:flex;align-items:center;gap:10px}
+.user-pill{
+  display:flex;align-items:center;gap:8px;
+  background:var(--surface);border:1px solid var(--border);
+  border-radius:99px;padding:5px 14px 5px 8px;
+  font-size:.75rem;color:var(--text2);
+}
+.user-dot{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
 
-  /* Grid */
-  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-  .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
-  .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+/* LAYOUT */
+.layout{display:flex;min-height:calc(100vh - 56px);position:relative;z-index:1}
+.sidebar{
+  width:220px;flex-shrink:0;
+  background:rgba(13,15,26,.6);
+  border-right:1px solid var(--border);
+  padding:20px 12px;
+  position:sticky;top:56px;height:calc(100vh - 56px);overflow-y:auto;
+}
+.main{flex:1;padding:28px;overflow:hidden}
 
-  /* Forms */
-  label{display:block;color:var(--text2);font-size:.8rem;margin-bottom:6px;margin-top:14px;font-weight:500;letter-spacing:.02em;text-transform:uppercase}
-  input,select,textarea{width:100%;padding:10px 13px;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:.9rem;font-family:'Space Grotesk',sans-serif;transition:border-color .2s}
-  input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(59,130,246,.1)}
-  select option{background:var(--surface)}
+/* SIDEBAR NAV */
+.nav-section{margin-bottom:24px}
+.nav-section-label{font-size:.62rem;font-family:var(--mono);color:var(--text3);letter-spacing:.15em;text-transform:uppercase;padding:0 8px;margin-bottom:8px}
+.nav-item{
+  display:flex;align-items:center;gap:10px;
+  padding:9px 12px;border-radius:8px;
+  color:var(--text2);font-size:.8rem;font-weight:500;
+  cursor:pointer;transition:all .15s;border:1px solid transparent;
+  margin-bottom:2px;
+}
+.nav-item:hover{background:var(--surface);color:var(--text);border-color:var(--border)}
+.nav-item.active{background:var(--surface2);color:var(--accent);border-color:var(--border2)}
+.nav-item .nav-icon{font-size:1rem;width:20px;text-align:center;flex-shrink:0}
+.nav-badge{margin-left:auto;font-size:.62rem;font-family:var(--mono);background:var(--accent);color:#fff;padding:1px 7px;border-radius:99px}
 
-  /* Buttons */
-  .btn{padding:9px 20px;border:none;border-radius:8px;cursor:pointer;font-size:.875rem;font-weight:600;font-family:'Space Grotesk',sans-serif;transition:all .2s;display:inline-flex;align-items:center;gap:6px}
-  .btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{background:#2563eb;transform:translateY(-1px)}
-  .btn-green{background:var(--green);color:#fff}.btn-green:hover{background:#059669}
-  .btn-danger{background:var(--red);color:#fff;font-size:.8rem;padding:5px 12px}.btn-danger:hover{background:#dc2626}
-  .btn-ghost{background:transparent;border:1px solid var(--border);color:var(--text2)}.btn-ghost:hover{border-color:var(--border2);color:var(--text)}
-  .btn-copy{background:var(--surface2);color:var(--text2);font-size:.75rem;padding:3px 10px;border:1px solid var(--border);border-radius:5px;cursor:pointer;font-family:var(--mono);transition:all .2s}
-  .btn-copy:hover{background:var(--border);color:var(--text)}
+/* CONTAINER */
+.container{max-width:1100px}
 
-  /* Table */
-  .table-wrap{overflow-x:auto;border-radius:10px;border:1px solid var(--border)}
-  table{width:100%;border-collapse:collapse;font-size:.82rem;min-width:600px}
-  th{text-align:left;padding:11px 14px;color:var(--text3);border-bottom:1px solid var(--border);font-weight:600;font-size:.75rem;text-transform:uppercase;letter-spacing:.05em;background:var(--surface2)}
-  td{padding:11px 14px;border-bottom:1px solid var(--border);color:var(--text2);vertical-align:middle}
-  tr:last-child td{border-bottom:none}
-  tr:hover td{background:var(--surface2)}
+/* CARDS */
+.card{
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:14px;
+  padding:22px 24px;
+  margin-bottom:18px;
+  position:relative;overflow:hidden;
+}
+.card::before{
+  content:'';position:absolute;inset:0;
+  background:linear-gradient(135deg,rgba(108,138,255,.03) 0%,transparent 50%);
+  pointer-events:none;border-radius:14px;
+}
+.card-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
+.card-title{font-size:.8rem;font-weight:600;color:var(--text);display:flex;align-items:center;gap:8px;letter-spacing:.03em;text-transform:uppercase}
+.card-title .icon{font-size:1rem}
 
-  /* Badges */
-  .badge{padding:3px 10px;border-radius:999px;font-size:.72rem;font-weight:600;font-family:var(--mono)}
-  .badge-green{background:rgba(16,185,129,.12);color:#34d399;border:1px solid rgba(16,185,129,.2)}
-  .badge-red{background:rgba(239,68,68,.12);color:#f87171;border:1px solid rgba(239,68,68,.2)}
-  .badge-yellow{background:rgba(245,158,11,.12);color:#fbbf24;border:1px solid rgba(245,158,11,.2)}
-  .badge-blue{background:rgba(59,130,246,.12);color:#60a5fa;border:1px solid rgba(59,130,246,.2)}
-  .badge-purple{background:rgba(99,102,241,.12);color:#a5b4fc;border:1px solid rgba(99,102,241,.2)}
-  .badge-cyan{background:rgba(6,182,212,.12);color:#22d3ee;border:1px solid rgba(6,182,212,.2)}
+/* STAT CARDS */
+.stats-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:20px}
+.stat-card{
+  background:var(--surface);border:1px solid var(--border);
+  border-radius:12px;padding:20px;position:relative;overflow:hidden;
+}
+.stat-card::after{
+  content:'';position:absolute;bottom:0;left:0;right:0;height:2px;
+  background:linear-gradient(90deg,var(--accent),var(--accent2));
+}
+.stat-num{
+  font-size:2rem;font-weight:700;font-family:var(--mono);
+  background:linear-gradient(135deg,var(--accent),var(--accent3));
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
+  line-height:1;
+}
+.stat-label{color:var(--text3);font-size:.7rem;margin-top:8px;font-family:var(--mono);letter-spacing:.08em;text-transform:uppercase}
+.stat-sub{color:var(--text2);font-size:.72rem;margin-top:3px}
 
-  /* Messages */
-  .msg{padding:10px 14px;border-radius:8px;font-size:.85rem;margin-top:12px;display:flex;align-items:center;gap:8px}
-  .msg.ok{background:rgba(16,185,129,.1);color:#34d399;border:1px solid rgba(16,185,129,.2)}
-  .msg.err{background:rgba(239,68,68,.1);color:#f87171;border:1px solid rgba(239,68,68,.2)}
+/* GRID */
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
 
-  /* Key display */
-  .key-display{background:var(--bg);border:1px solid var(--accent);border-radius:8px;padding:12px 16px;font-family:var(--mono);font-size:.85rem;color:#60a5fa;word-break:break-all;margin-top:12px;letter-spacing:.03em;position:relative}
+/* FORM */
+.field{margin-bottom:14px}
+.field label{display:block;color:var(--text3);font-size:.67rem;margin-bottom:6px;font-family:var(--mono);letter-spacing:.1em;text-transform:uppercase}
+input,select,textarea{
+  width:100%;padding:9px 13px;
+  background:var(--bg1);
+  border:1px solid var(--border);
+  border-radius:8px;color:var(--text);
+  font-size:.82rem;font-family:var(--sans);
+  transition:border-color .15s, box-shadow .15s;
+}
+input:focus,select:focus,textarea:focus{
+  outline:none;border-color:var(--accent);
+  box-shadow:0 0 0 3px rgba(108,138,255,.1);
+}
+select option{background:var(--surface)}
+.checkbox-group{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}
+.cb-item{
+  display:flex;align-items:center;gap:7px;
+  background:var(--bg1);border:1px solid var(--border);
+  border-radius:8px;padding:7px 12px;cursor:pointer;
+  font-size:.78rem;color:var(--text2);transition:all .15s;
+  user-select:none;
+}
+.cb-item:hover{border-color:var(--border2);color:var(--text)}
+.cb-item.checked{border-color:var(--accent);color:var(--accent);background:rgba(108,138,255,.08)}
+.cb-item input{display:none}
 
-  /* Stats */
-  .stat-card{background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:20px;text-align:center;position:relative;overflow:hidden}
-  .stat-card::before{content:'';position:absolute;inset:0;background:linear-gradient(135deg,rgba(59,130,246,.05),transparent);pointer-events:none}
-  .stat-num{font-size:2.2rem;font-weight:700;font-family:var(--mono);background:linear-gradient(135deg,var(--accent),var(--accent3));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
-  .stat-label{color:var(--text3);font-size:.8rem;margin-top:4px;font-weight:500;text-transform:uppercase;letter-spacing:.05em}
+/* BUTTONS */
+.btn{
+  padding:8px 18px;border:1px solid transparent;border-radius:8px;
+  cursor:pointer;font-size:.78rem;font-weight:600;font-family:var(--sans);
+  transition:all .15s;display:inline-flex;align-items:center;gap:6px;
+  letter-spacing:.02em;
+}
+.btn-primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+.btn-primary:hover{background:#5a78ee;box-shadow:0 4px 16px rgba(108,138,255,.3);transform:translateY(-1px)}
+.btn-green{background:rgba(61,250,170,.12);color:var(--green);border-color:rgba(61,250,170,.3)}
+.btn-green:hover{background:rgba(61,250,170,.2);box-shadow:0 4px 12px rgba(61,250,170,.15)}
+.btn-red{background:rgba(255,95,126,.1);color:var(--red);border-color:rgba(255,95,126,.25);font-size:.73rem;padding:5px 11px}
+.btn-red:hover{background:rgba(255,95,126,.18)}
+.btn-ghost{background:transparent;border-color:var(--border);color:var(--text2)}
+.btn-ghost:hover{border-color:var(--border2);color:var(--text)}
+.btn-sm{padding:5px 12px;font-size:.72rem}
+.copy-btn{
+  background:var(--bg2);color:var(--text3);
+  border:1px solid var(--border);border-radius:5px;
+  font-size:.65rem;padding:2px 8px;cursor:pointer;
+  font-family:var(--mono);transition:all .15s;
+}
+.copy-btn:hover{color:var(--text);border-color:var(--border2)}
 
-  /* Pre */
-  pre{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:16px;font-family:var(--mono);font-size:.8rem;color:#a5b4fc;overflow-x:auto;white-space:pre-wrap;word-break:break-all;line-height:1.6}
+/* TABLE */
+.table-wrap{overflow-x:auto;border-radius:10px;border:1px solid var(--border)}
+table{width:100%;border-collapse:collapse;font-size:.78rem;min-width:580px}
+thead th{
+  padding:10px 14px;color:var(--text3);
+  border-bottom:1px solid var(--border);
+  font-weight:600;font-size:.65rem;text-transform:uppercase;
+  letter-spacing:.08em;background:var(--bg2);white-space:nowrap;
+}
+tbody td{
+  padding:11px 14px;border-bottom:1px solid var(--border);
+  color:var(--text2);vertical-align:middle;
+}
+tbody tr:last-child td{border-bottom:none}
+tbody tr{transition:background .1s}
+tbody tr:hover td{background:rgba(108,138,255,.03)}
 
-  /* Endpoint box */
-  .endpoint-box{background:var(--bg);border:1px solid var(--border2);border-radius:8px;padding:14px;margin-top:14px;font-family:var(--mono);font-size:.78rem;color:var(--text2);line-height:2}
-  .endpoint-box .method{color:#34d399;font-weight:600;margin-right:8px}
-  .endpoint-box .url{color:#60a5fa}
+/* BADGES */
+.badge{padding:2px 9px;border-radius:99px;font-size:.65rem;font-weight:600;font-family:var(--mono);white-space:nowrap}
+.badge-green{background:rgba(61,250,170,.1);color:var(--green);border:1px solid rgba(61,250,170,.2)}
+.badge-red{background:rgba(255,95,126,.1);color:var(--red);border:1px solid rgba(255,95,126,.2)}
+.badge-yellow{background:rgba(255,209,102,.1);color:var(--yellow);border:1px solid rgba(255,209,102,.2)}
+.badge-blue{background:rgba(108,138,255,.1);color:var(--accent);border:1px solid rgba(108,138,255,.2)}
+.badge-purple{background:rgba(167,139,250,.1);color:var(--accent2);border:1px solid rgba(167,139,250,.2)}
+.badge-cyan{background:rgba(56,217,245,.1);color:var(--accent3);border:1px solid rgba(56,217,245,.2)}
 
-  /* Mobile */
-  @media(max-width:768px){
-    .grid2,.grid3,.grid4{grid-template-columns:1fr}
-    .topbar{padding:12px 16px}
-    .container{padding:20px 14px}
-    .card{padding:18px}
-    .tabs{gap:4px}
-    .tab{padding:7px 14px;font-size:.82rem}
-    table{font-size:.78rem}
-    th,td{padding:9px 10px}
-    .stat-num{font-size:1.8rem}
-  }
-  @media(max-width:480px){
-    .topbar-brand .ver{display:none}
-    .btn{padding:8px 14px;font-size:.82rem}
-  }
+/* TYPE BADGES */
+.badge-type-number{background:rgba(108,138,255,.1);color:var(--accent);border:1px solid rgba(108,138,255,.2)}
+.badge-type-rto{background:rgba(61,250,170,.1);color:var(--green);border:1px solid rgba(61,250,170,.2)}
+.badge-type-image{background:rgba(167,139,250,.1);color:var(--accent2);border:1px solid rgba(167,139,250,.2)}
+
+/* MESSAGES */
+.msg{padding:9px 13px;border-radius:8px;font-size:.78rem;margin-top:10px;display:flex;align-items:center;gap:8px}
+.msg-ok{background:rgba(61,250,170,.07);color:var(--green);border:1px solid rgba(61,250,170,.15)}
+.msg-err{background:rgba(255,95,126,.07);color:var(--red);border:1px solid rgba(255,95,126,.15)}
+
+/* KEY DISPLAY */
+.key-box{
+  background:var(--bg);border:1px solid rgba(108,138,255,.3);
+  border-radius:8px;padding:12px 16px;
+  font-family:var(--mono);font-size:.78rem;color:var(--accent3);
+  word-break:break-all;margin-top:10px;
+  box-shadow:0 0 20px rgba(108,138,255,.08);
+}
+
+/* SESSION CARD */
+.session-item{
+  background:var(--bg1);border:1px solid var(--border);
+  border-radius:10px;padding:12px 16px;
+  display:flex;align-items:center;justify-content:space-between;
+  margin-bottom:8px;
+}
+.session-info{display:flex;flex-direction:column;gap:3px}
+.session-device{font-size:.8rem;color:var(--text);font-weight:500}
+.session-meta{font-size:.7rem;color:var(--text3);font-family:var(--mono)}
+
+/* ENDPOINT BOX */
+.ep-item{
+  background:var(--bg1);border:1px solid var(--border);
+  border-radius:8px;padding:12px 14px;margin-bottom:8px;
+}
+.ep-method{color:var(--green);font-family:var(--mono);font-size:.73rem;font-weight:700;margin-right:8px}
+.ep-url{color:var(--accent);font-family:var(--mono);font-size:.73rem}
+.ep-prefix{color:var(--text3);font-size:.68rem;font-family:var(--mono);margin-top:4px}
+
+/* PRE */
+pre{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:14px;font-family:var(--mono);font-size:.73rem;color:#a5b4fc;overflow-x:auto;white-space:pre-wrap;word-break:break-all;line-height:1.65}
+
+/* SPINNER */
+.spin{display:inline-block;width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:rot .6s linear infinite;vertical-align:middle}
+@keyframes rot{to{transform:rotate(360deg)}}
+
+/* DIVIDER */
+.divider{height:1px;background:var(--border);margin:18px 0}
+
+/* MOBILE */
+@media(max-width:900px){
+  .sidebar{display:none}
+  .main{padding:20px 16px}
+  .stats-grid{grid-template-columns:1fr 1fr}
+  .grid2,.grid3{grid-template-columns:1fr}
+}
+@media(max-width:600px){
+  .stats-grid{grid-template-columns:1fr}
+  .topbar{padding:0 16px}
+  .brand-tag{display:none}
+}
 `;
 
 // ─────────────────────────────────────────────
@@ -297,59 +497,76 @@ const loginHtml = () => `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Aerivue — Admin Login</title>
+<title>Aerivue</title>
 <style>
-${CSS_VARS}
-${BASE_CSS}
-body{display:flex;align-items:center;justify-content:center;min-height:100vh;background:var(--bg)}
-body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse 80% 50% at 50% -10%,rgba(59,130,246,.15),transparent);pointer-events:none}
-.login-wrap{width:100%;max-width:400px;padding:20px}
-.login-logo{text-align:center;margin-bottom:32px}
-.login-logo .icon{font-size:2.5rem;display:block;margin-bottom:8px}
-.login-logo h1{font-size:1.5rem;font-weight:700;background:linear-gradient(135deg,#60a5fa,#818cf8);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
-.login-logo p{color:var(--text3);font-size:.85rem;margin-top:4px}
-.login-card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:32px}
-.login-btn{width:100%;margin-top:24px;padding:12px;background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;border:none;border-radius:9px;font-size:1rem;cursor:pointer;font-weight:700;font-family:'Space Grotesk',sans-serif;letter-spacing:.02em;transition:all .2s}
-.login-btn:hover{opacity:.9;transform:translateY(-1px);box-shadow:0 8px 24px rgba(59,130,246,.3)}
-.err-box{background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.2);color:#f87171;font-size:.85rem;padding:10px 14px;border-radius:8px;margin-top:14px;display:none;text-align:center}
+${CSS_VARS}${BASE_CSS}
+body{display:flex;align-items:center;justify-content:center;min-height:100vh}
+.login-wrap{width:100%;max-width:380px;padding:20px;position:relative;z-index:1}
+.login-top{text-align:center;margin-bottom:32px}
+.login-logo{
+  width:52px;height:52px;background:linear-gradient(135deg,var(--accent),var(--accent2));
+  border-radius:14px;display:flex;align-items:center;justify-content:center;
+  font-size:22px;margin:0 auto 14px;
+  box-shadow:0 8px 32px rgba(108,138,255,.4);
+}
+.login-top h1{font-size:1.4rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--text)}
+.login-top p{color:var(--text3);font-size:.72rem;font-family:var(--mono);margin-top:4px;letter-spacing:.06em;text-transform:uppercase}
+.login-card{
+  background:var(--surface);border:1px solid var(--border);
+  border-radius:16px;padding:28px;
+}
+.login-card .field{margin-bottom:0}
+.login-submit{
+  width:100%;margin-top:20px;padding:11px;
+  background:linear-gradient(135deg,var(--accent) 0%,var(--accent2) 100%);
+  color:#fff;border:none;border-radius:9px;font-size:.85rem;
+  cursor:pointer;font-weight:700;font-family:var(--sans);
+  letter-spacing:.04em;transition:all .2s;
+  box-shadow:0 4px 20px rgba(108,138,255,.25);
+}
+.login-submit:hover{transform:translateY(-1px);box-shadow:0 8px 28px rgba(108,138,255,.4)}
+.err-msg{display:none;margin-top:12px;text-align:center}
+.login-footer{text-align:center;margin-top:20px;font-size:.65rem;font-family:var(--mono);color:var(--text3);letter-spacing:.06em;text-transform:uppercase}
 </style>
 </head>
 <body>
 <div class="login-wrap">
-  <div class="login-logo">
-    <span class="icon">⚡</span>
+  <div class="login-top">
+    <div class="login-logo">⚡</div>
     <h1>Aerivue</h1>
     <p>API Management System</p>
   </div>
   <div class="login-card">
-    <div>
+    <div class="field" style="margin-bottom:12px">
       <label>Username</label>
-      <input type="text" id="username" placeholder="Enter username" autocomplete="username">
-      <label>Password</label>
-      <input type="password" id="password" placeholder="••••••••" autocomplete="current-password">
-      <button class="login-btn" onclick="doLogin()">Sign In →</button>
-      <div class="err-box" id="err"></div>
+      <input type="text" id="usr" placeholder="Enter username" autocomplete="username">
     </div>
+    <div class="field">
+      <label>Password</label>
+      <input type="password" id="pwd" placeholder="••••••••" autocomplete="current-password">
+    </div>
+    <button class="login-submit" onclick="doLogin()">Sign In →</button>
+    <div id="err" class="msg msg-err err-msg"></div>
   </div>
+  <div class="login-footer">Secure · Private · Fast</div>
 </div>
 <script>
 async function doLogin() {
-  const username = document.getElementById('username').value.trim();
-  const password = document.getElementById('password').value;
+  const username = document.getElementById('usr').value.trim();
+  const password = document.getElementById('pwd').value;
   const errEl = document.getElementById('err');
   errEl.style.display = 'none';
-  if (!username || !password) { errEl.textContent = 'Fill all fields'; errEl.style.display = 'block'; return; }
+  if (!username || !password) { errEl.textContent = '✗ Fill all fields'; errEl.style.display = 'flex'; return; }
   const res = await fetch('/admin/login', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
+    method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({ username, password })
   });
   const data = await res.json();
   if (res.ok) {
     window.location.href = data.role === 'superadmin' ? '/admin/dashboard' : '/admin/panel';
   } else {
-    errEl.textContent = data.error || 'Login failed';
-    errEl.style.display = 'block';
+    errEl.textContent = '✗ ' + (data.error || 'Login failed');
+    errEl.style.display = 'flex';
   }
 }
 document.addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
@@ -364,202 +581,357 @@ const superAdminDashboardHtml = () => `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Super Admin — Aerivue</title>
+<title>Super Admin · Aerivue</title>
 <style>
-${CSS_VARS}
-${BASE_CSS}
-.type-badge-number{background:rgba(59,130,246,.12);color:#60a5fa;border:1px solid rgba(59,130,246,.2)}
-.type-badge-rto{background:rgba(16,185,129,.12);color:#34d399;border:1px solid rgba(16,185,129,.2)}
-.type-badge-image{background:rgba(168,85,247,.12);color:#c084fc;border:1px solid rgba(168,85,247,.2)}
+${CSS_VARS}${BASE_CSS}
 </style>
 </head>
 <body>
 <div class="topbar">
   <div class="topbar-brand">
-    <span style="font-size:1.3rem">⚡</span>
-    <h1 style="background:linear-gradient(135deg,#60a5fa,#818cf8);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text">Aerivue</h1>
-    <span class="ver">SUPER ADMIN</span>
+    <div class="brand-mark">A</div>
+    <span class="brand-name">Aerivue</span>
+    <span class="brand-tag">Super Admin</span>
   </div>
-  <div class="topbar-actions">
-    <span id="userInfo" style="font-size:.82rem;color:var(--text3)"></span>
-    <button class="btn btn-ghost" onclick="logout()">Logout</button>
+  <div class="topbar-right">
+    <div class="user-pill">
+      <span class="user-dot"></span>
+      <span id="topUsername" style="font-weight:600;color:var(--text)"></span>
+    </div>
+    <button class="btn btn-ghost btn-sm" onclick="logout()">Logout</button>
   </div>
 </div>
-<div class="container">
-  <div class="tabs">
-    <button class="tab active" onclick="switchTab('overview')">📊 Overview</button>
-    <button class="tab" onclick="switchTab('admins')">👥 Admins</button>
-    <button class="tab" onclick="switchTab('keys')">🔑 All Keys</button>
-  </div>
 
-  <!-- OVERVIEW -->
-  <div class="panel active" id="panel-overview">
-    <div class="grid3" style="margin-bottom:20px">
-      <div class="stat-card"><div class="stat-num" id="totalAdmins">—</div><div class="stat-label">Total Admins</div></div>
-      <div class="stat-card"><div class="stat-num" id="totalKeys">—</div><div class="stat-label">Total API Keys</div></div>
-      <div class="stat-card"><div class="stat-num" id="activeKeys">—</div><div class="stat-label">Active Keys</div></div>
-    </div>
-    <div class="card">
-      <div class="card-title"><span>📡</span> Available API Endpoints</div>
-      <div class="endpoint-box" id="endpointList">Loading...</div>
-    </div>
-  </div>
-
-  <!-- ADMINS -->
-  <div class="panel" id="panel-admins">
-    <div class="card">
-      <div class="card-title"><span>➕</span> Create New Admin</div>
-      <div class="grid2">
-        <div><label>Username</label><input type="text" id="newAdminUser" placeholder="admin_name"></div>
-        <div><label>Password</label><input type="password" id="newAdminPass" placeholder="••••••••"></div>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="nav-section">
+      <div class="nav-section-label">Main</div>
+      <div class="nav-item active" onclick="nav('overview',this)">
+        <span class="nav-icon">◈</span> Overview
       </div>
-      <div style="margin-top:16px"><button class="btn btn-primary" onclick="createAdmin()">Create Admin</button></div>
-      <div id="adminMsg"></div>
-    </div>
-    <div class="card">
-      <div class="card-title"><span>👥</span> All Admins</div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Username</th><th>Created</th><th>Keys</th><th>Action</th></tr></thead>
-          <tbody id="adminTable"><tr><td colspan="4" style="text-align:center;color:var(--text3);padding:24px">Loading...</td></tr></tbody>
-        </table>
+      <div class="nav-item" onclick="nav('sessions',this)">
+        <span class="nav-icon">⊙</span> Sessions
+        <span class="nav-badge" id="sideSessionBadge">—</span>
       </div>
     </div>
-  </div>
-
-  <!-- ALL API KEYS -->
-  <div class="panel" id="panel-keys">
-    <div class="card">
-      <div class="card-title"><span>🔑</span> All API Keys (across all admins)</div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Key</th><th>Label</th><th>Admin</th><th>Type</th><th>Expires</th><th>Usage</th><th>Status</th><th>Action</th></tr></thead>
-          <tbody id="allKeysTable"><tr><td colspan="8" style="text-align:center;color:var(--text3);padding:24px">Loading...</td></tr></tbody>
-        </table>
+    <div class="nav-section">
+      <div class="nav-section-label">Management</div>
+      <div class="nav-item" onclick="nav('admins',this)">
+        <span class="nav-icon">◎</span> Admins
+      </div>
+      <div class="nav-item" onclick="nav('keys',this)">
+        <span class="nav-icon">◆</span> All Keys
       </div>
     </div>
-  </div>
+  </aside>
+
+  <main class="main">
+    <!-- OVERVIEW -->
+    <div id="pane-overview" class="pane">
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-num" id="s-admins">—</div>
+          <div class="stat-label">Total Admins</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-num" id="s-keys">—</div>
+          <div class="stat-label">Total Keys</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-num" id="s-active">—</div>
+          <div class="stat-label">Active Keys</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title"><span class="icon">◈</span> My Active Sessions</div>
+        </div>
+        <div id="mySessions">Loading...</div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title"><span class="icon">◈</span> API Endpoints</div>
+        </div>
+        <div id="epList"></div>
+      </div>
+    </div>
+
+    <!-- SESSIONS -->
+    <div id="pane-sessions" class="pane" style="display:none">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title"><span class="icon">⊙</span> All Active Sessions</div>
+          <button class="btn btn-ghost btn-sm" onclick="loadAllSessions()">↺ Refresh</button>
+        </div>
+        <div id="allSessionsWrap"></div>
+      </div>
+    </div>
+
+    <!-- ADMINS -->
+    <div id="pane-admins" class="pane" style="display:none">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title"><span class="icon">+</span> Create Admin</div>
+        </div>
+        <div class="grid2">
+          <div class="field"><label>Username</label><input type="text" id="newAdminUser" placeholder="admin_name"></div>
+          <div class="field"><label>Password</label><input type="password" id="newAdminPass" placeholder="••••••••"></div>
+        </div>
+        <div class="field">
+          <label>API Access</label>
+          <div class="checkbox-group" id="accessCheckboxes">
+            <div class="cb-item checked" data-type="all" onclick="toggleCb(this)">
+              <span>✦ All Access</span>
+            </div>
+            ${API_REGISTRY.map(a => `<div class="cb-item" data-type="${a.type}" onclick="toggleCb(this)">
+              <span>${a.icon} ${a.label}</span>
+            </div>`).join("")}
+          </div>
+        </div>
+        <div style="margin-top:14px">
+          <button class="btn btn-primary" onclick="createAdmin()">Create Admin</button>
+        </div>
+        <div id="adminMsg"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title"><span class="icon">◎</span> All Admins</div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Username</th><th>Access</th><th>Keys</th><th>Sessions</th><th>Created</th><th></th></tr></thead>
+            <tbody id="adminTable"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- ALL KEYS -->
+    <div id="pane-keys" class="pane" style="display:none">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title"><span class="icon">◆</span> All API Keys</div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Key</th><th>Label</th><th>Admin</th><th>Type</th><th>Expires</th><th>Usage</th><th>Status</th><th></th></tr></thead>
+            <tbody id="allKeysTable"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </main>
 </div>
 
 <script>
-const API_TYPES = ${JSON.stringify(
-  API_REGISTRY.map((a) => ({ type: a.type, label: a.label, icon: a.icon, route: a.route, paramName: a.paramName }))
-)};
+const API_TYPES = ${JSON.stringify(API_REGISTRY.map(a => ({ type: a.type, label: a.label, icon: a.icon, route: a.route, paramName: a.paramName, prefix: a.prefix })))};
 
 async function apiFetch(url, opts={}) {
-  const res = await fetch(url, { ...opts, headers: {'Content-Type':'application/json', ...(opts.headers||{})} });
-  return [res.status, await res.json()];
+  const r = await fetch(url, {...opts, headers:{\'Content-Type\':\'application/json\',...(opts.headers||{})}});
+  return [r.status, await r.json()];
 }
 
 async function logout() {
-  await apiFetch('/admin/logout', {method:'POST'});
-  window.location.href = '/admin';
+  await apiFetch(\'/admin/logout\', {method:\'POST\'});
+  window.location.href = \'/admin\';
 }
 
-function switchTab(name) {
-  document.querySelectorAll('.tab').forEach((t,i) => {
-    t.classList.toggle('active', ['overview','admins','keys'][i] === name);
-  });
-  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
-  document.getElementById('panel-'+name).classList.add('active');
-  if(name==='overview') loadOverview();
-  if(name==='admins') loadAdmins();
-  if(name==='keys') loadAllKeys();
+function nav(name, el) {
+  document.querySelectorAll(\'.nav-item\').forEach(i => i.classList.remove(\'active\'));
+  el.classList.add(\'active\');
+  document.querySelectorAll(\'.pane\').forEach(p => p.style.display = \'none\');
+  document.getElementById(\'pane-\'+name).style.display = \'block\';
+  if(name===\'overview\') loadOverview();
+  if(name===\'sessions\') loadAllSessions();
+  if(name===\'admins\') loadAdmins();
+  if(name===\'keys\') loadAllKeys();
 }
 
 function showMsg(id, text, ok) {
   const el = document.getElementById(id);
-  el.innerHTML = '<div class="msg '+(ok?'ok':'err')+'">'+(ok?'✓':'✗')+' '+text+'</div>';
-  setTimeout(() => el.innerHTML='', 4000);
+  el.innerHTML = \'<div class="msg \'+(ok?\'msg-ok\':\'msg-err\')+\'">\'+(ok?\'✓\':\'✗\')+\' \'+text+\'</div>\';
+  setTimeout(()=>el.innerHTML=\'\',4000);
 }
 
-function getTypeBadge(type) {
-  const api = API_TYPES.find(a => a.type === type);
-  const cls = 'type-badge-'+type;
-  return '<span class="badge '+cls+'">'+(api ? api.icon+' '+api.label : type)+'</span>';
+function typeBadge(type) {
+  const a = API_TYPES.find(x=>x.type===type);
+  return \'<span class="badge badge-type-\'+type+\'">\'+(a?a.icon+\' \'+a.label:type)+\'</span>\';
+}
+
+function accessBadges(types) {
+  if(!types||types.includes(\'all\')) return \'<span class="badge badge-purple">✦ All</span>\';
+  return types.map(t => typeBadge(t)).join(\' \');
+}
+
+// Access checkbox logic
+function toggleCb(el) {
+  const all = document.querySelector(\'[data-type="all"]\');
+  if(el.dataset.type === \'all\') {
+    // Select all
+    document.querySelectorAll(\'#accessCheckboxes .cb-item\').forEach(c => c.classList.add(\'checked\'));
+  } else {
+    all.classList.remove(\'checked\');
+    el.classList.toggle(\'checked\');
+    // If none selected, re-check all
+    const anyChecked = [...document.querySelectorAll(\'#accessCheckboxes .cb-item:not([data-type="all"])\')].some(c=>c.classList.contains(\'checked\'));
+    if(!anyChecked) all.classList.add(\'checked\');
+  }
+}
+
+function getSelectedAccess() {
+  const all = document.querySelector(\'[data-type="all"]\');
+  if(all.classList.contains(\'checked\')) return [\'all\'];
+  return [...document.querySelectorAll(\'#accessCheckboxes .cb-item:not([data-type="all"])\')].filter(c=>c.classList.contains(\'checked\')).map(c=>c.dataset.type);
 }
 
 async function loadOverview() {
-  const [,stats] = await apiFetch('/admin/api/stats');
-  document.getElementById('totalAdmins').textContent = stats.totalAdmins ?? '—';
-  document.getElementById('totalKeys').textContent = stats.totalKeys ?? '—';
-  document.getElementById('activeKeys').textContent = stats.activeKeys ?? '—';
+  const [,stats] = await apiFetch(\'/admin/api/stats\');
+  document.getElementById(\'s-admins\').textContent = stats.totalAdmins ?? \'—\';
+  document.getElementById(\'s-keys\').textContent = stats.totalKeys ?? \'—\';
+  document.getElementById(\'s-active\').textContent = stats.activeKeys ?? \'—\';
 
-  const ep = document.getElementById('endpointList');
-  ep.innerHTML = API_TYPES.map(a =>
-    '<div><span class="method">GET</span><span class="url">/'+a.route.replace('/','')+'?'+a.paramName+'=VALUE&apikey=YOUR_KEY</span></div>'
-  ).join('');
+  // my sessions
+  const [,sessData] = await apiFetch(\'/admin/api/sessions/me\');
+  const msEl = document.getElementById(\'mySessions\');
+  if(!sessData.sessions?.length) { msEl.innerHTML=\'<p style="color:var(--text3);font-size:.78rem">No active sessions.</p>\'; }
+  else {
+    msEl.innerHTML = sessData.sessions.map(s => sessionItem(s, true)).join(\'\');
+  }
+
+  // endpoints
+  document.getElementById(\'epList\').innerHTML = API_TYPES.map(a=>\`
+    <div class="ep-item">
+      <span class="ep-method">GET</span><span class="ep-url">\${a.route}?\${a.paramName}=VALUE&apikey=YOUR_KEY</span>
+      <div class="ep-prefix">Prefix: \${a.prefix}...</div>
+    </div>\`).join(\'\');
+
+  // sidebar badge
+  const [,allSess] = await apiFetch(\'/admin/api/sessions/all\');
+  const totalSessions = allSess.total || 0;
+  document.getElementById(\'sideSessionBadge\').textContent = totalSessions;
+}
+
+function sessionItem(s, isMe=false) {
+  const device = parseDevice(s.userAgent);
+  const since = new Date(s.createdAt).toLocaleString();
+  const seen = new Date(s.lastSeen).toLocaleString();
+  return \`<div class="session-item">
+    <div class="session-info">
+      <div class="session-device">\${device}</div>
+      <div class="session-meta">IP: \${s.ip} · Login: \${since}</div>
+      <div class="session-meta">Last seen: \${seen}</div>
+    </div>
+    <button class="btn btn-red btn-sm" onclick="revokeSession(\'\${s._id}\')">Revoke</button>
+  </div>\`;
+}
+
+function parseDevice(ua=\'\') {
+  if(!ua) return \'🖥 Unknown\';
+  if(/mobile/i.test(ua)) return \'📱 Mobile\';
+  if(/tablet/i.test(ua)) return \'📟 Tablet\';
+  return \'🖥 Desktop\';
+}
+
+async function revokeSession(id) {
+  if(!confirm(\'Revoke this session?\')) return;
+  const [,d] = await apiFetch(\'/admin/api/sessions/\'+id, {method:\'DELETE\'});
+  loadOverview(); loadAllSessions();
+}
+
+async function loadAllSessions() {
+  const [,data] = await apiFetch(\'/admin/api/sessions/all\');
+  const wrap = document.getElementById(\'allSessionsWrap\');
+  if(!data.byUser) { wrap.innerHTML=\'<p style="color:var(--text3);font-size:.78rem;padding:8px">No active sessions.</p>\'; return; }
+  document.getElementById(\'sideSessionBadge\').textContent = data.total || 0;
+  let html = \'\';
+  for(const [user, sessions] of Object.entries(data.byUser)) {
+    html += \`<div style="margin-bottom:20px">
+      <div style="font-size:.72rem;font-family:var(--mono);color:var(--text3);letter-spacing:.08em;text-transform:uppercase;margin-bottom:8px;display:flex;align-items:center;gap:8px">
+        ◎ \${user} <span class="badge badge-blue">\${sessions.length} session\${sessions.length>1?\'s\':\'\'}</span>
+        \${user !== \'${process.env.SUPER_ADMIN_USERNAME}\' ? \'<button class="btn btn-red" onclick="revokeAllForUser(\\\'\' + user + \'\\\')">Revoke All</button>\' : \'\'}
+      </div>
+      \${sessions.map(s=>sessionItem(s)).join(\'\')}
+    </div>\`;
+  }
+  wrap.innerHTML = html || \'<p style="color:var(--text3);font-size:.78rem;padding:8px">No active sessions.</p>\';
+}
+
+async function revokeAllForUser(username) {
+  if(!confirm(\'Revoke all sessions for \'+username+\'?\')) return;
+  await apiFetch(\'/admin/api/sessions/user/\'+username, {method:\'DELETE\'});
+  loadAllSessions();
 }
 
 async function loadAdmins() {
-  const [,data] = await apiFetch('/admin/api/admins');
-  const tb = document.getElementById('adminTable');
-  if(!data.admins?.length){
-    tb.innerHTML='<tr><td colspan="4" style="text-align:center;color:var(--text3);padding:20px">No admins yet</td></tr>';return;
-  }
-  tb.innerHTML = data.admins.map(a => \`<tr>
-    <td><strong style="color:var(--text)">\${a.username}</strong></td>
-    <td>\${new Date(a.createdAt).toLocaleDateString()}</td>
-    <td><span class="badge badge-blue">\${a.keyCount} keys</span></td>
-    <td><button class="btn btn-danger" onclick="deleteAdmin('\${a.username}')">Delete</button></td>
-  </tr>\`).join('');
+  const [,data] = await apiFetch(\'/admin/api/admins\');
+  const tb = document.getElementById(\'adminTable\');
+  if(!data.admins?.length) { tb.innerHTML=\'<tr><td colspan="6" style="text-align:center;color:var(--text3);padding:20px">No admins yet</td></tr>\'; return; }
+  tb.innerHTML = data.admins.map(a=>\`<tr>
+    <td style="font-weight:600;color:var(--text)">\${a.username}</td>
+    <td>\${accessBadges(a.allowedTypes)}</td>
+    <td><span class="badge badge-blue">\${a.keyCount}</span></td>
+    <td><span class="badge \${a.sessionCount>0?\'badge-green\':\'badge-yellow\'}">\${a.sessionCount} online</span></td>
+    <td style="font-family:var(--mono);font-size:.68rem;color:var(--text3)">\${new Date(a.createdAt).toLocaleDateString()}</td>
+    <td><button class="btn btn-red" onclick="deleteAdmin(\'\${a.username}\')">Delete</button></td>
+  </tr>\`).join(\'\');
 }
 
 async function createAdmin() {
-  const username = document.getElementById('newAdminUser').value.trim();
-  const password = document.getElementById('newAdminPass').value;
-  if(!username||!password) return showMsg('adminMsg','Fill all fields',false);
-  const [status,data] = await apiFetch('/admin/api/admins', {method:'POST', body:JSON.stringify({username,password})});
-  showMsg('adminMsg', data.message||data.error, status===201);
+  const username = document.getElementById(\'newAdminUser\').value.trim();
+  const password = document.getElementById(\'newAdminPass\').value;
+  const allowedTypes = getSelectedAccess();
+  if(!username||!password) return showMsg(\'adminMsg\',\'Fill all fields\',false);
+  const [status,data] = await apiFetch(\'/admin/api/admins\', {method:\'POST\', body:JSON.stringify({username,password,allowedTypes})});
+  showMsg(\'adminMsg\', data.message||data.error, status===201);
   if(status===201) {
-    document.getElementById('newAdminUser').value='';
-    document.getElementById('newAdminPass').value='';
+    document.getElementById(\'newAdminUser\').value=\'\';
+    document.getElementById(\'newAdminPass\').value=\'\';
     loadAdmins(); loadOverview();
   }
 }
 
 async function deleteAdmin(username) {
-  if(!confirm('Delete admin "'+username+'" and ALL their API keys?')) return;
-  const [status,data] = await apiFetch('/admin/api/admins/'+username, {method:'DELETE'});
-  showMsg('adminMsg', data.message||data.error, status===200);
+  if(!confirm(\'Delete admin "\'+username+\'" and ALL their API keys?\')) return;
+  const [status,data] = await apiFetch(\'/admin/api/admins/\'+username, {method:\'DELETE\'});
+  showMsg(\'adminMsg\', data.message||data.error, status===200);
   loadAdmins(); loadOverview();
 }
 
 async function loadAllKeys() {
-  const [,data] = await apiFetch('/admin/api/all-keys');
-  const tb = document.getElementById('allKeysTable');
-  if(!data.keys?.length){
-    tb.innerHTML='<tr><td colspan="8" style="text-align:center;color:var(--text3);padding:20px">No keys yet</td></tr>';return;
-  }
-  tb.innerHTML = data.keys.map(k => {
+  const [,data] = await apiFetch(\'/admin/api/all-keys\');
+  const tb = document.getElementById(\'allKeysTable\');
+  if(!data.keys?.length) { tb.innerHTML=\'<tr><td colspan="8" style="text-align:center;color:var(--text3);padding:20px">No keys yet</td></tr>\'; return; }
+  tb.innerHTML = data.keys.map(k=>{
     const exp = new Date(k.expiresAt);
     const expired = exp < new Date();
-    const statusBadge = (!k.isActive||expired)
-      ? '<span class="badge badge-red">'+(expired?'Expired':'Disabled')+'</span>'
-      : '<span class="badge badge-green">Active</span>';
-    const usage = k.usageLimit ? k.usageCount+'/'+k.usageLimit : k.usageCount+'/∞';
+    const st = (!k.isActive||expired) ? \'<span class="badge badge-red">\'+(expired?\'Expired\':\'Off\')+\'</span>\' : \'<span class="badge badge-green">Active</span>\';
+    const use = k.usageLimit ? k.usageCount+\'/\'+k.usageLimit : k.usageCount+\'/∞\';
     return \`<tr>
-      <td style="font-family:var(--mono);font-size:.72rem;color:#60a5fa">\${k.key}</td>
-      <td>\${k.label||'—'}</td>
-      <td style="color:var(--text)">\${k.createdBy}</td>
-      <td>\${getTypeBadge(k.keyType)}</td>
-      <td style="font-size:.8rem">\${exp.toLocaleDateString()}</td>
-      <td style="font-family:var(--mono);font-size:.8rem">\${usage}</td>
-      <td>\${statusBadge}</td>
-      <td><button class="btn btn-danger" onclick="superDeleteKey('\${k._id}')">Delete</button></td>
+      <td style="font-family:var(--mono);font-size:.68rem;color:var(--accent3)">\${k.key.substring(0,16)}... <button class="copy-btn" onclick="copy(\'\${k.key}\')">copy</button></td>
+      <td style="color:var(--text2)">\${k.label||\'—\'}</td>
+      <td style="font-weight:600;color:var(--text)">\${k.createdBy}</td>
+      <td>\${typeBadge(k.keyType)}</td>
+      <td style="font-family:var(--mono);font-size:.68rem">\${exp.toLocaleDateString()}</td>
+      <td style="font-family:var(--mono)">\${use}</td>
+      <td>\${st}</td>
+      <td><button class="btn btn-red" onclick="superDeleteKey(\'\${k._id}\')">Delete</button></td>
     </tr>\`;
-  }).join('');
+  }).join(\'\');
 }
 
 async function superDeleteKey(id) {
-  if(!confirm('Delete this API key?')) return;
-  const [status,data] = await apiFetch('/admin/api/all-keys/'+id, {method:'DELETE'});
-  showMsg('adminMsg', data.message||data.error, status===200);
+  if(!confirm(\'Delete this API key?\')) return;
+  const [,d] = await apiFetch(\'/admin/api/all-keys/\'+id, {method:\'DELETE\'});
   loadAllKeys(); loadOverview();
 }
 
-apiFetch('/admin/api/me').then(([,d]) => {
-  document.getElementById('userInfo').textContent = d.username || '';
+function copy(t) { navigator.clipboard.writeText(t); }
+
+apiFetch(\'/admin/api/me\').then(([,d])=>{
+  document.getElementById(\'topUsername\').textContent = d.username||\'\';
 });
 loadOverview();
 </script>
@@ -573,153 +945,130 @@ const adminPanelHtml = () => `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Admin Panel — Aerivue</title>
+<title>Admin Panel · Aerivue</title>
 <style>
-${CSS_VARS}
-${BASE_CSS}
-.type-badge-number{background:rgba(59,130,246,.12);color:#60a5fa;border:1px solid rgba(59,130,246,.2)}
-.type-badge-rto{background:rgba(16,185,129,.12);color:#34d399;border:1px solid rgba(16,185,129,.2)}
-.type-badge-image{background:rgba(168,85,247,.12);color:#c084fc;border:1px solid rgba(168,85,247,.2)}
-.tabs .tab.active{background:var(--green);border-color:var(--green)}
-.generate-area{display:none;margin-top:16px;padding:16px;background:var(--bg);border:1px solid var(--border);border-radius:8px}
-.gen-result img{max-width:100%;border-radius:8px;margin-top:12px;border:1px solid var(--border)}
-.spinner{display:inline-block;width:18px;height:18px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle;margin-right:6px}
-@keyframes spin{to{transform:rotate(360deg)}}
+${CSS_VARS}${BASE_CSS}
 </style>
 </head>
 <body>
 <div class="topbar">
   <div class="topbar-brand">
-    <span style="font-size:1.3rem">⚡</span>
-    <h1 style="color:var(--green)">Aerivue</h1>
-    <span class="ver">ADMIN</span>
+    <div class="brand-mark">A</div>
+    <span class="brand-name">Aerivue</span>
+    <span class="brand-tag">Admin</span>
   </div>
-  <div class="topbar-actions">
-    <span id="welcomeUser" style="font-size:.82rem;color:var(--text3)"></span>
-    <button class="btn btn-ghost" onclick="logout()">Logout</button>
+  <div class="topbar-right">
+    <div class="user-pill">
+      <span class="user-dot" style="background:var(--green)"></span>
+      <span id="topUsername" style="font-weight:600;color:var(--text)"></span>
+    </div>
+    <button class="btn btn-ghost btn-sm" onclick="logout()">Logout</button>
   </div>
 </div>
-<div class="container">
-  <div class="tabs">
-    <button class="tab active" onclick="switchTab('keys')">🔑 My Keys</button>
-    <button class="tab" onclick="switchTab('test')">🧪 Test APIs</button>
-  </div>
 
-  <!-- MY KEYS -->
-  <div class="panel active" id="panel-keys">
-    <!-- Create Key -->
-    <div class="card">
-      <div class="card-title"><span>➕</span> Generate New API Key</div>
-      <div class="grid2" style="margin-bottom:4px">
-        <div>
-          <label>API Type</label>
-          <select id="keyType">
-            ${API_REGISTRY.map(
-              (a) =>
-                `<option value="${a.type}">${a.icon} ${a.label}</option>`
-            ).join("")}
-          </select>
-        </div>
-        <div>
-          <label>Label (optional)</label>
-          <input type="text" id="keyLabel" placeholder="e.g. My App">
-        </div>
-        <div>
-          <label>Expires In</label>
-          <select id="keyExpiry">
-            <option value="1">1 Day</option>
-            <option value="7" selected>7 Days</option>
-            <option value="30">30 Days</option>
-            <option value="90">90 Days</option>
-            <option value="365">1 Year</option>
-          </select>
-        </div>
-        <div>
-          <label>Usage Limit (0 = unlimited)</label>
-          <input type="number" id="keyLimit" value="0" min="0">
-        </div>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="nav-section">
+      <div class="nav-section-label">Main</div>
+      <div class="nav-item active" onclick="nav('keys',this)">
+        <span class="nav-icon">◆</span> My Keys
       </div>
-      <div style="margin-top:16px">
+      <div class="nav-item" onclick="nav('sessions',this)">
+        <span class="nav-icon">⊙</span> My Sessions
+      </div>
+      <div class="nav-item" onclick="nav('test',this)">
+        <span class="nav-icon">◈</span> Test APIs
+      </div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <!-- MY KEYS -->
+    <div id="pane-keys" class="pane">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title"><span class="icon">+</span> Generate API Key</div>
+        </div>
+        <div class="grid2">
+          <div class="field">
+            <label>API Type</label>
+            <select id="keyType" onchange="updateTypeSelector()">
+            </select>
+          </div>
+          <div class="field">
+            <label>Label</label>
+            <input type="text" id="keyLabel" placeholder="e.g. My App">
+          </div>
+          <div class="field">
+            <label>Expires In</label>
+            <select id="keyExpiry">
+              <option value="1">1 Day</option>
+              <option value="7" selected>7 Days</option>
+              <option value="30">30 Days</option>
+              <option value="90">90 Days</option>
+              <option value="365">1 Year</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Usage Limit (0 = unlimited)</label>
+            <input type="number" id="keyLimit" value="0" min="0">
+          </div>
+        </div>
         <button class="btn btn-green" onclick="createKey()">⚡ Generate Key</button>
+        <div id="newKeyDisplay" style="display:none;margin-top:14px">
+          <div style="font-size:.7rem;font-family:var(--mono);color:var(--text3);margin-bottom:4px;letter-spacing:.08em;text-transform:uppercase">Your Key — Save it now</div>
+          <div class="key-box" id="newKeyVal"></div>
+          <button class="copy-btn" style="margin-top:8px" onclick="copy(document.getElementById('newKeyVal').textContent)">Copy Key</button>
+        </div>
+        <div id="keyMsg"></div>
       </div>
-      <div id="newKeyDisplay" style="display:none">
-        <label>Your New API Key — Copy it now!</label>
-        <div class="key-display" id="newKeyVal"></div>
-        <button class="btn-copy" style="margin-top:8px" onclick="copyText(document.getElementById('newKeyVal').textContent)">Copy Key</button>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title"><span class="icon">◆</span> My API Keys</div>
+          <button class="btn btn-ghost btn-sm" onclick="loadMyKeys()">↺</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Key</th><th>Label</th><th>Type</th><th>Expires</th><th>Usage</th><th>Status</th><th></th></tr></thead>
+            <tbody id="myKeysTable"></tbody>
+          </table>
+        </div>
       </div>
-      <div id="keyMsg"></div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title"><span class="icon">◈</span> Endpoints Reference</div>
+        </div>
+        <div id="epRef"></div>
+      </div>
     </div>
 
-    <!-- Keys Table -->
-    <div class="card">
-      <div class="card-title"><span>🔑</span> My API Keys</div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Key</th><th>Label</th><th>Type</th><th>Expires</th><th>Usage</th><th>Status</th><th>Action</th></tr></thead>
-          <tbody id="myKeysTable"><tr><td colspan="7" style="text-align:center;color:var(--text3);padding:24px">Loading...</td></tr></tbody>
-        </table>
+    <!-- SESSIONS -->
+    <div id="pane-sessions" class="pane" style="display:none">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title"><span class="icon">⊙</span> My Active Sessions</div>
+          <button class="btn btn-ghost btn-sm" onclick="loadMySessions()">↺ Refresh</button>
+        </div>
+        <div id="mySessionsWrap">Loading...</div>
       </div>
     </div>
 
-    <!-- Endpoints Reference -->
-    <div class="card">
-      <div class="card-title"><span>📡</span> API Endpoints Reference</div>
-      <div id="endpointRef"></div>
+    <!-- TEST -->
+    <div id="pane-test" class="pane" style="display:none">
+      <div id="testCardsWrap"></div>
     </div>
-  </div>
-
-  <!-- TEST APIs -->
-  <div class="panel" id="panel-test">
-    <!-- Number Lookup -->
-    <div class="card">
-      <div class="card-title"><span>📞</span> Test Number Lookup</div>
-      <div class="grid2">
-        <div><label>Phone Number</label><input type="text" id="testNumber" placeholder="9876543210"></div>
-        <div><label>API Key (ak_...)</label><input type="text" id="testNumberKey" placeholder="ak_..."></div>
-      </div>
-      <div style="margin-top:14px"><button class="btn btn-primary" onclick="testLookup()">Lookup</button></div>
-      <pre id="lookupResult" style="display:none;margin-top:14px"></pre>
-    </div>
-
-    <!-- RTO Lookup -->
-    <div class="card">
-      <div class="card-title"><span>🚗</span> Test RTO Lookup</div>
-      <div class="grid2">
-        <div><label>Vehicle RC Number</label><input type="text" id="testRC" placeholder="KL43G1669"></div>
-        <div><label>API Key (rto_...)</label><input type="text" id="testRTOKey" placeholder="rto_..."></div>
-      </div>
-      <div style="margin-top:14px"><button class="btn btn-primary" onclick="testRTO()">Lookup</button></div>
-      <pre id="rtoResult" style="display:none;margin-top:14px"></pre>
-    </div>
-
-    <!-- Image Generator -->
-    <div class="card">
-      <div class="card-title"><span>🎨</span> Test Image / Logo Generator</div>
-      <div class="grid2">
-        <div><label>Prompt</label><input type="text" id="testPrompt" placeholder="e.g. a futuristic lion logo"></div>
-        <div><label>API Key (img_...)</label><input type="text" id="testImgKey" placeholder="img_..."></div>
-      </div>
-      <div style="margin-top:14px"><button class="btn btn-primary" id="genBtn" onclick="testGenerate()">Generate</button></div>
-      <div id="genResult" style="margin-top:14px"></div>
-    </div>
-  </div>
+  </main>
 </div>
 
 <script>
-const API_TYPES = ${JSON.stringify(
-  API_REGISTRY.map((a) => ({
-    type: a.type,
-    label: a.label,
-    icon: a.icon,
-    route: a.route,
-    paramName: a.paramName,
-    prefix: a.prefix,
-  }))
-)};
+const API_TYPES = ${JSON.stringify(API_REGISTRY.map(a => ({ type: a.type, label: a.label, icon: a.icon, route: a.route, paramName: a.paramName, prefix: a.prefix })))};
+let allowedTypes = [];
 
 async function apiFetch(url, opts={}) {
-  const res = await fetch(url, { ...opts, headers: {'Content-Type':'application/json', ...(opts.headers||{})} });
-  return [res.status, await res.json()];
+  const r = await fetch(url, {...opts, headers:{'Content-Type':'application/json',...(opts.headers||{})}});
+  return [r.status, await r.json()];
 }
 
 async function logout() {
@@ -727,55 +1076,81 @@ async function logout() {
   window.location.href = '/admin';
 }
 
-function switchTab(name) {
-  document.querySelectorAll('.tab').forEach((t,i) => {
-    t.classList.toggle('active', ['keys','test'][i] === name);
-  });
-  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
-  document.getElementById('panel-'+name).classList.add('active');
+function nav(name, el) {
+  document.querySelectorAll('.nav-item').forEach(i=>i.classList.remove('active'));
+  el.classList.add('active');
+  document.querySelectorAll('.pane').forEach(p=>p.style.display='none');
+  document.getElementById('pane-'+name).style.display='block';
+  if(name==='keys') loadMyKeys();
+  if(name==='sessions') loadMySessions();
+  if(name==='test') buildTestCards();
 }
 
 function showMsg(id, text, ok) {
   const el = document.getElementById(id);
-  el.innerHTML = '<div class="msg '+(ok?'ok':'err')+'">'+(ok?'✓':'✗')+' '+text+'</div>';
-  setTimeout(() => el.innerHTML='', 5000);
+  el.innerHTML = '<div class="msg '+(ok?'msg-ok':'msg-err')+'">'+(ok?'✓':'✗')+' '+text+'</div>';
+  setTimeout(()=>el.innerHTML='',5000);
 }
 
-function getTypeBadge(type) {
-  const api = API_TYPES.find(a => a.type === type);
-  return '<span class="badge type-badge-'+type+'">'+(api ? api.icon+' '+api.label : type)+'</span>';
+function typeBadge(type) {
+  const a = API_TYPES.find(x=>x.type===type);
+  return '<span class="badge badge-type-'+type+'">'+(a?a.icon+' '+a.label:type)+'</span>';
 }
 
-function copyText(t) {
-  navigator.clipboard.writeText(t);
+function copy(t) { navigator.clipboard.writeText(t); }
+
+function parseDevice(ua='') {
+  if(!ua) return '🖥 Unknown';
+  if(/mobile/i.test(ua)) return '📱 Mobile';
+  if(/tablet/i.test(ua)) return '📟 Tablet';
+  return '🖥 Desktop';
+}
+
+async function loadMySessions() {
+  const [,data] = await apiFetch('/admin/api/sessions/me');
+  const wrap = document.getElementById('mySessionsWrap');
+  if(!data.sessions?.length) { wrap.innerHTML='<p style="color:var(--text3);font-size:.78rem">No active sessions.</p>'; return; }
+  wrap.innerHTML = data.sessions.map(s => \`<div class="session-item">
+    <div class="session-info">
+      <div class="session-device">\${parseDevice(s.userAgent)}</div>
+      <div class="session-meta">IP: \${s.ip} · Login: \${new Date(s.createdAt).toLocaleString()}</div>
+      <div class="session-meta">Last seen: \${new Date(s.lastSeen).toLocaleString()}</div>
+    </div>
+    <button class="btn btn-red btn-sm" onclick="revokeMySession('\${s._id}')">Revoke</button>
+  </div>\`).join('');
+}
+
+async function revokeMySession(id) {
+  if(!confirm('Revoke this session?')) return;
+  await apiFetch('/admin/api/sessions/'+id, {method:'DELETE'});
+  loadMySessions();
 }
 
 async function loadMyKeys() {
   const [,data] = await apiFetch('/admin/api/my-keys');
   const tb = document.getElementById('myKeysTable');
-  if(!data.keys?.length){
-    tb.innerHTML='<tr><td colspan="7" style="text-align:center;color:var(--text3);padding:20px">No keys created yet</td></tr>';
-    return;
+  if(!data.keys?.length) {
+    tb.innerHTML='<tr><td colspan="7" style="text-align:center;color:var(--text3);padding:20px">No keys yet</td></tr>'; return;
   }
-  tb.innerHTML = data.keys.map(k => {
+  tb.innerHTML = data.keys.map(k=>{
     const exp = new Date(k.expiresAt);
     const expired = exp < new Date();
-    let statusBadge;
-    if(!k.isActive) statusBadge='<span class="badge badge-red">Disabled</span>';
-    else if(expired) statusBadge='<span class="badge badge-yellow">Expired</span>';
-    else statusBadge='<span class="badge badge-green">Active</span>';
-    const usage = k.usageLimit ? k.usageCount+'/'+k.usageLimit : k.usageCount+'/∞';
+    let st;
+    if(!k.isActive) st='<span class="badge badge-red">Off</span>';
+    else if(expired) st='<span class="badge badge-yellow">Expired</span>';
+    else st='<span class="badge badge-green">Active</span>';
+    const use = k.usageLimit ? k.usageCount+'/'+k.usageLimit : k.usageCount+'/∞';
     return \`<tr>
-      <td style="font-family:var(--mono);font-size:.72rem;color:#60a5fa">
+      <td style="font-family:var(--mono);font-size:.68rem;color:var(--accent3)">
         \${k.key.substring(0,16)}...
-        <button class="btn-copy" onclick="copyText('\${k.key}')">Copy</button>
+        <button class="copy-btn" onclick="copy('\${k.key}')">copy</button>
       </td>
       <td>\${k.label||'—'}</td>
-      <td>\${getTypeBadge(k.keyType)}</td>
-      <td style="font-size:.8rem">\${exp.toLocaleDateString()}</td>
-      <td style="font-family:var(--mono);font-size:.8rem">\${usage}</td>
-      <td>\${statusBadge}</td>
-      <td><button class="btn btn-danger" onclick="deleteKey('\${k._id}')">Delete</button></td>
+      <td>\${typeBadge(k.keyType)}</td>
+      <td style="font-family:var(--mono);font-size:.68rem">\${exp.toLocaleDateString()}</td>
+      <td style="font-family:var(--mono)">\${use}</td>
+      <td>\${st}</td>
+      <td><button class="btn btn-red" onclick="deleteKey('\${k._id}')">Delete</button></td>
     </tr>\`;
   }).join('');
 }
@@ -784,100 +1159,114 @@ async function createKey() {
   const keyType = document.getElementById('keyType').value;
   const label = document.getElementById('keyLabel').value.trim();
   const days = parseInt(document.getElementById('keyExpiry').value);
-  const usageLimit = parseInt(document.getElementById('keyLimit').value) || 0;
-  const [status,data] = await apiFetch('/admin/api/my-keys', {
-    method:'POST',
-    body: JSON.stringify({ label, days, usageLimit, keyType })
-  });
+  const usageLimit = parseInt(document.getElementById('keyLimit').value)||0;
+  const [status,data] = await apiFetch('/admin/api/my-keys', {method:'POST', body:JSON.stringify({label,days,usageLimit,keyType})});
   if(status===201) {
     document.getElementById('newKeyVal').textContent = data.key;
     document.getElementById('newKeyDisplay').style.display='block';
     document.getElementById('keyLabel').value='';
     loadMyKeys();
   } else {
-    showMsg('keyMsg', data.error||'Failed to create key', false);
+    showMsg('keyMsg', data.error||'Failed', false);
   }
 }
 
 async function deleteKey(id) {
-  if(!confirm('Delete this API key? This cannot be undone.')) return;
+  if(!confirm('Delete this API key?')) return;
   const [status,data] = await apiFetch('/admin/api/my-keys/'+id, {method:'DELETE'});
   showMsg('keyMsg', data.message||data.error, status===200);
   loadMyKeys();
 }
 
-async function testLookup() {
-  const number = document.getElementById('testNumber').value.trim();
-  const key = document.getElementById('testNumberKey').value.trim();
-  if(!number||!key){alert('Enter number and API key');return;}
-  const res = await fetch('/lookup?number='+encodeURIComponent(number)+'&apikey='+encodeURIComponent(key));
-  const data = await res.json();
-  const el = document.getElementById('lookupResult');
-  el.style.display='block';
-  el.textContent = JSON.stringify(data, null, 2);
+function buildTestCards() {
+  const wrap = document.getElementById('testCardsWrap');
+  const visible = API_TYPES.filter(a => allowedTypes.includes('all') || allowedTypes.includes(a.type));
+  if(!visible.length) { wrap.innerHTML='<div class="card"><p style="color:var(--text3)">No API access granted.</p></div>'; return; }
+
+  wrap.innerHTML = visible.map(a => {
+    if(a.type === 'image') return \`
+      <div class="card">
+        <div class="card-title"><span class="icon">\${a.icon}</span> Test \${a.label}</div>
+        <div class="grid2" style="margin-top:14px">
+          <div class="field"><label>Prompt</label><input type="text" id="testPrompt" placeholder="e.g. futuristic lion"></div>
+          <div class="field"><label>API Key (img_...)</label><input type="text" id="testImgKey" placeholder="img_..."></div>
+        </div>
+        <button class="btn btn-primary btn-sm" id="genBtn" onclick="testGenerate()">Generate</button>
+        <div id="genResult" style="margin-top:14px"></div>
+      </div>\`;
+    return \`
+      <div class="card">
+        <div class="card-title"><span class="icon">\${a.icon}</span> Test \${a.label}</div>
+        <div class="grid2" style="margin-top:14px">
+          <div class="field"><label>\${a.paramName.toUpperCase()}</label><input type="text" id="test_\${a.type}_val" placeholder="\${a.paramName}..."></div>
+          <div class="field"><label>API Key (\${a.prefix}...)</label><input type="text" id="test_\${a.type}_key" placeholder="\${a.prefix}..."></div>
+        </div>
+        <button class="btn btn-primary btn-sm" onclick="testGeneric('\${a.type}','\${a.route}','\${a.paramName}')">Test</button>
+        <pre id="result_\${a.type}" style="display:none;margin-top:12px"></pre>
+      </div>\`;
+  }).join('');
 }
 
-async function testRTO() {
-  const rc = document.getElementById('testRC').value.trim();
-  const key = document.getElementById('testRTOKey').value.trim();
-  if(!rc||!key){alert('Enter RC number and API key');return;}
-  const res = await fetch('/rto?rc='+encodeURIComponent(rc)+'&apikey='+encodeURIComponent(key));
+async function testGeneric(type, route, paramName) {
+  const val = document.getElementById('test_'+type+'_val').value.trim();
+  const key = document.getElementById('test_'+type+'_key').value.trim();
+  if(!val||!key) { alert('Fill both fields'); return; }
+  const res = await fetch(route+'?'+paramName+'='+encodeURIComponent(val)+'&apikey='+encodeURIComponent(key));
   const data = await res.json();
-  const el = document.getElementById('rtoResult');
+  const el = document.getElementById('result_'+type);
   el.style.display='block';
-  el.textContent = JSON.stringify(data, null, 2);
+  el.textContent = JSON.stringify(data,null,2);
 }
 
 async function testGenerate() {
   const prompt = document.getElementById('testPrompt').value.trim();
   const key = document.getElementById('testImgKey').value.trim();
-  if(!prompt||!key){alert('Enter prompt and API key');return;}
-  const genBtn = document.getElementById('genBtn');
-  const genResult = document.getElementById('genResult');
-  genBtn.disabled=true;
-  genBtn.innerHTML='<span class="spinner"></span> Generating...';
-  genResult.innerHTML='<div style="color:var(--text2);font-size:.85rem">⏳ Starting generation...</div>';
+  if(!prompt||!key){alert('Fill both fields');return;}
+  const btn = document.getElementById('genBtn');
+  const res = document.getElementById('genResult');
+  btn.disabled=true;btn.innerHTML='<span class="spin"></span> Generating...';
+  res.innerHTML='<div style="color:var(--text2);font-size:.78rem">⏳ Starting...</div>';
   try {
-    const res = await fetch('/generate?prompt='+encodeURIComponent(prompt)+'&apikey='+encodeURIComponent(key));
-    const data = await res.json();
-    if(!res.ok){ genResult.innerHTML='<pre>'+JSON.stringify(data,null,2)+'</pre>'; return; }
-    const taskId = data.task_id;
-    genResult.innerHTML='<div style="color:var(--text2);font-size:.85rem">⏳ Task started: <code style="color:#60a5fa">'+taskId+'</code><br>Polling for result...</div>';
+    const r = await fetch('/generate?prompt='+encodeURIComponent(prompt)+'&apikey='+encodeURIComponent(key));
+    const d = await r.json();
+    if(!r.ok){res.innerHTML='<pre>'+JSON.stringify(d,null,2)+'</pre>';btn.disabled=false;btn.textContent='Generate';return;}
+    const taskId = d.task_id;
+    res.innerHTML='<div style="color:var(--text2);font-size:.78rem">Task: <code style="color:var(--accent)">'+taskId+'</code> — polling...</div>';
     let attempts=0;
-    const poll = setInterval(async () => {
+    const poll=setInterval(async()=>{
       attempts++;
-      const cr = await fetch('/generate/check?task_id='+encodeURIComponent(taskId)+'&apikey='+encodeURIComponent(key));
-      const cd = await cr.json();
+      const cr=await fetch('/generate/check?task_id='+encodeURIComponent(taskId)+'&apikey='+encodeURIComponent(key));
+      const cd=await cr.json();
       if(cd.image_url){
         clearInterval(poll);
-        genResult.innerHTML='<div style="color:#34d399;font-size:.85rem;margin-bottom:8px">✓ Image ready!</div><img src="'+cd.image_url+'" style="max-width:100%;border-radius:8px;border:1px solid var(--border)"><div style="margin-top:8px"><a href="'+cd.image_url+'" target="_blank" class="btn btn-primary" style="font-size:.8rem;padding:6px 14px">Open Full Image</a></div>';
-        genBtn.disabled=false; genBtn.textContent='Generate';
+        res.innerHTML='<div style="color:var(--green);font-size:.78rem;margin-bottom:8px">✓ Ready</div><img src="'+cd.image_url+'" style="max-width:100%;border-radius:8px;border:1px solid var(--border)"><div style="margin-top:8px"><a href="'+cd.image_url+'" target="_blank" class="btn btn-primary btn-sm">Open Image</a></div>';
+        btn.disabled=false;btn.textContent='Generate';
       } else if(attempts>30){
         clearInterval(poll);
-        genResult.innerHTML='<div style="color:var(--yellow)">⚠ Timed out. Try again.</div>';
-        genBtn.disabled=false; genBtn.textContent='Generate';
+        res.innerHTML='<div style="color:var(--yellow)">⚠ Timed out.</div>';
+        btn.disabled=false;btn.textContent='Generate';
       }
-    }, 3000);
-  } catch(e) {
-    genResult.innerHTML='<div style="color:var(--red)">Error: '+e.message+'</div>';
-    genBtn.disabled=false; genBtn.textContent='Generate';
+    },3000);
+  } catch(e){
+    res.innerHTML='<div style="color:var(--red)">Error: '+e.message+'</div>';
+    btn.disabled=false;btn.textContent='Generate';
   }
 }
 
-// Build endpoint reference
-const epRef = document.getElementById('endpointRef');
-if(epRef) {
-  epRef.innerHTML = API_TYPES.map(a => \`
-    <div style="margin-bottom:16px;padding:14px;background:var(--bg);border:1px solid var(--border);border-radius:8px">
-      <div style="margin-bottom:8px;font-weight:600;color:var(--text)">\${a.icon} \${a.label}</div>
-      <div style="font-family:var(--mono);font-size:.78rem;color:#60a5fa">GET \${a.route}?\${a.paramName}=VALUE&apikey=YOUR_KEY</div>
-      <div style="font-size:.78rem;color:var(--text3);margin-top:4px">Key prefix: <code style="color:#a5b4fc">\${a.prefix}...</code></div>
-    </div>
-  \`).join('');
-}
-
-apiFetch('/admin/api/me').then(([,d]) => {
-  document.getElementById('welcomeUser').textContent = d.username || '';
+// Init
+apiFetch('/admin/api/me').then(([,d])=>{
+  document.getElementById('topUsername').textContent = d.username||'';
+  allowedTypes = d.allowedTypes || ['all'];
+  // Populate type selector
+  const sel = document.getElementById('keyType');
+  const visible = API_TYPES.filter(a => allowedTypes.includes('all') || allowedTypes.includes(a.type));
+  sel.innerHTML = visible.map(a=>'<option value="'+a.type+'">'+a.icon+' '+a.label+'</option>').join('');
+  // Endpoint ref
+  const epRef = document.getElementById('epRef');
+  epRef.innerHTML = visible.map(a=>\`<div class="ep-item">
+    <span class="ep-method">GET</span><span class="ep-url">\${a.route}?\${a.paramName}=VALUE&apikey=YOUR_KEY</span>
+    <div class="ep-prefix">Prefix: \${a.prefix}...</div>
+  </div>\`).join('');
 });
 loadMyKeys();
 </script>
@@ -892,18 +1281,13 @@ app.get("/admin", (req, res) => {
   if (token) {
     try {
       const user = jwt.verify(token, process.env.JWT_SECRET);
-      return res.redirect(
-        isSuperAdmin(user.username) ? "/admin/dashboard" : "/admin/panel"
-      );
+      return res.redirect(isSuperAdmin(user.username) ? "/admin/dashboard" : "/admin/panel");
     } catch {}
   }
   res.send(loginHtml());
 });
 
-app.get("/admin/dashboard", authMiddleware, superAdminOnly, (req, res) => {
-  res.send(superAdminDashboardHtml());
-});
-
+app.get("/admin/dashboard", authMiddleware, superAdminOnly, (req, res) => res.send(superAdminDashboardHtml()));
 app.get("/admin/panel", authMiddleware, (req, res) => {
   if (isSuperAdmin(req.user.username)) return res.redirect("/admin/dashboard");
   res.send(adminPanelHtml());
@@ -911,32 +1295,84 @@ app.get("/admin/panel", authMiddleware, (req, res) => {
 
 app.post("/admin/login", async (req, res) => {
   const { username, password } = req.body;
-  if (!username || !password)
-    return res.status(400).json({ error: "Missing credentials" });
+  if (!username || !password) return res.status(400).json({ error: "Missing credentials" });
 
   if (username === process.env.SUPER_ADMIN_USERNAME) {
-    if (password !== process.env.SUPER_ADMIN_PASSWORD)
-      return res.status(401).json({ error: "Invalid credentials" });
-    const token = signToken({ username, role: "superadmin" });
+    if (password !== process.env.SUPER_ADMIN_PASSWORD) return res.status(401).json({ error: "Invalid credentials" });
+    const sessionId = await createSession(username, req);
+    const token = signToken({ username, role: "superadmin" }, sessionId);
     res.cookie("token", token, { httpOnly: true, maxAge: 8 * 3600 * 1000 });
     return res.json({ success: true, role: "superadmin" });
   }
 
   const admin = await Admin.findOne({ username });
-  if (!admin || !(await bcrypt.compare(password, admin.password)))
-    return res.status(401).json({ error: "Invalid credentials" });
-  const token = signToken({ username, role: "admin" });
+  if (!admin || !(await bcrypt.compare(password, admin.password))) return res.status(401).json({ error: "Invalid credentials" });
+  const sessionId = await createSession(username, req);
+  const token = signToken({ username, role: "admin" }, sessionId);
   res.cookie("token", token, { httpOnly: true, maxAge: 8 * 3600 * 1000 });
   return res.json({ success: true, role: "admin" });
 });
 
-app.post("/admin/logout", (req, res) => {
+app.post("/admin/logout", authMiddleware, async (req, res) => {
+  if (req.user?.sessionId) await removeSession(req.user.sessionId);
   res.clearCookie("token");
   res.json({ success: true });
 });
 
-app.get("/admin/api/me", authMiddleware, (req, res) => {
-  res.json({ username: req.user.username, role: req.user.role });
+app.get("/admin/api/me", authMiddleware, async (req, res) => {
+  if (isSuperAdmin(req.user.username)) {
+    return res.json({ username: req.user.username, role: "superadmin", allowedTypes: ["all"] });
+  }
+  const admin = await Admin.findOne({ username: req.user.username });
+  res.json({ username: req.user.username, role: "admin", allowedTypes: admin?.allowedTypes || ["all"] });
+});
+
+// ─────────────────────────────────────────────
+// SESSION ROUTES
+// ─────────────────────────────────────────────
+
+// Clean expired sessions helper
+async function cleanExpiredSessions() {
+  await Session.deleteMany({ expiresAt: { $lt: new Date() } });
+}
+
+// My sessions
+app.get("/admin/api/sessions/me", authMiddleware, async (req, res) => {
+  await cleanExpiredSessions();
+  const sessions = await Session.find({ username: req.user.username }).sort({ lastSeen: -1 }).lean();
+  res.json({ sessions });
+});
+
+// All sessions (super admin)
+app.get("/admin/api/sessions/all", authMiddleware, superAdminOnly, async (req, res) => {
+  await cleanExpiredSessions();
+  const sessions = await Session.find().sort({ username: 1, lastSeen: -1 }).lean();
+  const byUser = {};
+  for (const s of sessions) {
+    if (!byUser[s.username]) byUser[s.username] = [];
+    byUser[s.username].push(s);
+  }
+  res.json({ byUser, total: sessions.length });
+});
+
+// Revoke single session
+app.delete("/admin/api/sessions/:id", authMiddleware, async (req, res) => {
+  const session = await Session.findById(req.params.id);
+  if (!session) return res.status(404).json({ error: "Session not found" });
+  // Admin can only revoke own sessions; superadmin can revoke any
+  if (!isSuperAdmin(req.user.username) && session.username !== req.user.username) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+  await Session.findByIdAndDelete(req.params.id);
+  res.json({ message: "Session revoked" });
+});
+
+// Revoke all sessions for a user (super admin only)
+app.delete("/admin/api/sessions/user/:username", authMiddleware, superAdminOnly, async (req, res) => {
+  const { username } = req.params;
+  if (username === process.env.SUPER_ADMIN_USERNAME) return res.status(400).json({ error: "Cannot revoke superadmin sessions" });
+  await Session.deleteMany({ username });
+  res.json({ message: `All sessions revoked for ${username}` });
 });
 
 // ─────────────────────────────────────────────
@@ -944,47 +1380,46 @@ app.get("/admin/api/me", authMiddleware, (req, res) => {
 // ─────────────────────────────────────────────
 
 app.get("/admin/api/stats", authMiddleware, superAdminOnly, async (req, res) => {
+  await cleanExpiredSessions();
   const totalAdmins = await Admin.countDocuments();
   const totalKeys = await ApiKey.countDocuments();
-  const activeKeys = await ApiKey.countDocuments({
-    isActive: true,
-    expiresAt: { $gt: new Date() },
-  });
+  const activeKeys = await ApiKey.countDocuments({ isActive: true, expiresAt: { $gt: new Date() } });
   res.json({ totalAdmins, totalKeys, activeKeys });
 });
 
 app.get("/admin/api/admins", authMiddleware, superAdminOnly, async (req, res) => {
+  await cleanExpiredSessions();
   const admins = await Admin.find({}, { password: 0 }).lean();
-  const result = await Promise.all(
-    admins.map(async (a) => ({
-      ...a,
-      keyCount: await ApiKey.countDocuments({ createdBy: a.username }),
-    }))
-  );
+  const result = await Promise.all(admins.map(async (a) => ({
+    ...a,
+    keyCount: await ApiKey.countDocuments({ createdBy: a.username }),
+    sessionCount: await Session.countDocuments({ username: a.username }),
+  })));
   res.json({ admins: result });
 });
 
 app.post("/admin/api/admins", authMiddleware, superAdminOnly, async (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password)
-    return res.status(400).json({ error: "Username and password required" });
-  if (username === process.env.SUPER_ADMIN_USERNAME)
-    return res.status(400).json({ error: "Reserved username" });
+  const { username, password, allowedTypes = ["all"] } = req.body;
+  if (!username || !password) return res.status(400).json({ error: "Username and password required" });
+  if (username === process.env.SUPER_ADMIN_USERNAME) return res.status(400).json({ error: "Reserved username" });
   const exists = await Admin.findOne({ username });
   if (exists) return res.status(409).json({ error: "Admin already exists" });
   const hashed = await bcrypt.hash(password, 10);
-  await Admin.create({ username, password: hashed });
-  res.status(201).json({ message: `Admin "${username}" created successfully` });
+  // Validate allowedTypes
+  const validTypes = [...API_REGISTRY.map(a => a.type), "all"];
+  const filteredTypes = allowedTypes.filter(t => validTypes.includes(t));
+  await Admin.create({ username, password: hashed, allowedTypes: filteredTypes.length ? filteredTypes : ["all"] });
+  res.status(201).json({ message: `Admin "${username}" created` });
 });
 
 app.delete("/admin/api/admins/:username", authMiddleware, superAdminOnly, async (req, res) => {
   const { username } = req.params;
-  if (username === process.env.SUPER_ADMIN_USERNAME)
-    return res.status(400).json({ error: "Cannot delete super admin" });
+  if (username === process.env.SUPER_ADMIN_USERNAME) return res.status(400).json({ error: "Cannot delete super admin" });
   const admin = await Admin.findOneAndDelete({ username });
   if (!admin) return res.status(404).json({ error: "Admin not found" });
   await ApiKey.deleteMany({ createdBy: username });
-  res.json({ message: `Admin "${username}" and all their keys deleted` });
+  await Session.deleteMany({ username });
+  res.json({ message: `Admin "${username}" deleted` });
 });
 
 app.get("/admin/api/all-keys", authMiddleware, superAdminOnly, async (req, res) => {
@@ -1003,26 +1438,26 @@ app.delete("/admin/api/all-keys/:id", authMiddleware, superAdminOnly, async (req
 // ─────────────────────────────────────────────
 
 app.get("/admin/api/my-keys", authMiddleware, async (req, res) => {
-  const keys = await ApiKey.find({ createdBy: req.user.username })
-    .sort({ createdAt: -1 })
-    .lean();
+  const keys = await ApiKey.find({ createdBy: req.user.username }).sort({ createdAt: -1 }).lean();
   res.json({ keys });
 });
 
 app.post("/admin/api/my-keys", authMiddleware, async (req, res) => {
   const { label, days = 7, usageLimit = 0, keyType = "number" } = req.body;
-  if (!API_REGISTRY.find((a) => a.type === keyType))
-    return res.status(400).json({ error: "Invalid key type" });
+  if (!API_REGISTRY.find((a) => a.type === keyType)) return res.status(400).json({ error: "Invalid key type" });
+
+  // Check access permission
+  if (!isSuperAdmin(req.user.username)) {
+    const admin = await Admin.findOne({ username: req.user.username });
+    const allowed = admin?.allowedTypes || ["all"];
+    if (!allowed.includes("all") && !allowed.includes(keyType)) {
+      return res.status(403).json({ error: `You don't have access to create ${keyType} keys` });
+    }
+  }
+
   const expiresAt = new Date(Date.now() + days * 24 * 3600 * 1000);
   const key = generateApiKey(keyType);
-  await ApiKey.create({
-    key,
-    label: label || "",
-    createdBy: req.user.username,
-    expiresAt,
-    usageLimit: usageLimit > 0 ? usageLimit : null,
-    keyType,
-  });
+  await ApiKey.create({ key, label: label || "", createdBy: req.user.username, expiresAt, usageLimit: usageLimit > 0 ? usageLimit : null, keyType });
   res.status(201).json({ key, expiresAt, message: "API key created" });
 });
 
@@ -1038,16 +1473,13 @@ app.delete("/admin/api/my-keys/:id", authMiddleware, async (req, res) => {
 // PUBLIC API ROUTES
 // ─────────────────────────────────────────────
 
-// 1. Number Lookup → /lookup?number=XXXX
 app.get("/lookup", async (req, res) => {
   const { number } = req.query;
   const apiKey = req.headers["x-api-key"] || req.query.apikey;
   if (!number) return res.status(400).json({ error: "number query param required" });
   if (!apiKey) return res.status(401).json({ error: "API key required" });
-
   const { error, status, keyDoc } = await validateApiKey(apiKey, "number");
   if (error) return res.status(status).json({ error });
-
   try {
     const upstreamUrl = `${process.env.UPSTREAM_API_URL}?number=${encodeURIComponent(number)}`;
     const response = await axios.get(upstreamUrl, { timeout: 10000 });
@@ -1062,16 +1494,13 @@ app.get("/lookup", async (req, res) => {
   }
 });
 
-// 2. RTO Lookup → /rto?rc=XXXX
 app.get("/rto", async (req, res) => {
   const { rc } = req.query;
   const apiKey = req.headers["x-api-key"] || req.query.apikey;
   if (!rc) return res.status(400).json({ error: "rc query param required" });
   if (!apiKey) return res.status(401).json({ error: "API key required" });
-
   const { error, status, keyDoc } = await validateApiKey(apiKey, "rto");
   if (error) return res.status(status).json({ error });
-
   try {
     const upstreamUrl = `${process.env.UPSTREAM_RTO_API_URL}?rc=${encodeURIComponent(rc)}`;
     const response = await axios.get(upstreamUrl, { timeout: 10000 });
@@ -1085,16 +1514,13 @@ app.get("/rto", async (req, res) => {
   }
 });
 
-// 3. Image Generation (async two-step) → /generate?prompt=XXXX
 app.get("/generate", async (req, res) => {
   const { prompt } = req.query;
   const apiKey = req.headers["x-api-key"] || req.query.apikey;
   if (!prompt) return res.status(400).json({ error: "prompt query param required" });
   if (!apiKey) return res.status(401).json({ error: "API key required" });
-
   const { error, status, keyDoc } = await validateApiKey(apiKey, "image");
   if (error) return res.status(status).json({ error });
-
   try {
     const upstreamUrl = `${process.env.UPSTREAM_IMAGE_API_URL}?prompt=${encodeURIComponent(prompt)}`;
     const response = await axios.get(upstreamUrl, { timeout: 15000 });
@@ -1108,20 +1534,16 @@ app.get("/generate", async (req, res) => {
   }
 });
 
-// 3b. Image Check → /generate/check?task_id=XXXX
 app.get("/generate/check", async (req, res) => {
   const { task_id } = req.query;
   const apiKey = req.headers["x-api-key"] || req.query.apikey;
   if (!task_id) return res.status(400).json({ error: "task_id required" });
   if (!apiKey) return res.status(401).json({ error: "API key required" });
-
-  // Validate key exists (no usage increment for check)
   const keyDoc = await ApiKey.findOne({ key: apiKey });
   if (!keyDoc) return res.status(401).json({ error: "Invalid API key" });
   if (!keyDoc.isActive) return res.status(403).json({ error: "API key is disabled" });
   if (keyDoc.keyType !== "image") return res.status(403).json({ error: "Not authorized" });
   if (keyDoc.expiresAt < new Date()) return res.status(403).json({ error: "API key expired" });
-
   try {
     const checkUrl = `${process.env.UPSTREAM_IMAGE_CHECK_URL}?task=${encodeURIComponent(task_id)}`;
     const response = await axios.get(checkUrl, { timeout: 10000 });
@@ -1142,13 +1564,13 @@ async function start() {
   try {
     await mongoose.connect(process.env.MONGODB_URI);
     console.log("✅ MongoDB connected");
+    // Clean old sessions on startup
+    await Session.deleteMany({ expiresAt: { $lt: new Date() } });
     app.listen(process.env.PORT || 3000, () => {
       console.log(`\n🚀 Server: http://localhost:${process.env.PORT || 3000}`);
       console.log(`🔐 Admin:  http://localhost:${process.env.PORT || 3000}/admin`);
       console.log(`\n📡 Public Endpoints:`);
-      API_REGISTRY.forEach((a) => {
-        console.log(`   ${a.icon}  /${a.route.replace("/", "")}?${a.paramName}=VALUE&apikey=YOUR_KEY`);
-      });
+      API_REGISTRY.forEach((a) => console.log(`   ${a.icon}  ${a.route}?${a.paramName}=VALUE&apikey=YOUR_KEY`));
       console.log("");
     });
   } catch (err) {
