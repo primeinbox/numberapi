@@ -52,6 +52,16 @@ const API_REGISTRY = [
     asyncGenerate: true,
     checkEnvKey: "UPSTREAM_IMAGE_CHECK_URL",
   },
+  {
+    type: "telegram",
+    label: "Telegram Lookup",
+    prefix: "tg_",
+    route: "/tg",
+    paramName: "userid",
+    envKey: "UPSTREAM_TG_API_URL",
+    description: "Telegram user ID lookup",
+    icon: "✈️",
+  },
 ];
 
 // ─── SCHEMAS ─────────────────────────────────────────────────────────────────
@@ -436,6 +446,27 @@ app.get("/rto", async (req, res) => {
   } catch (err) {
     if (err.response) return res.status(err.response.status).json(err.response.data);
     return res.status(500).json({ error: "Upstream RTO API error" });
+  }
+});
+
+app.get("/tg", async (req, res) => {
+  const { userid } = req.query;
+  const apiKey = req.headers["x-api-key"] || req.query.apikey;
+  if (!userid) return res.status(400).json({ error: "userid query param required" });
+  if (!apiKey) return res.status(401).json({ error: "API key required" });
+  const { error, status, keyDoc } = await validateApiKey(apiKey, "telegram");
+  if (error) return res.status(status).json({ error });
+  try {
+    const url = `${process.env.UPSTREAM_TG_API_URL}?key=${process.env.TG_API_KEY}&type=tg&term=${encodeURIComponent(userid)}`;
+    const response = await axios.get(url, { timeout: 10000 });
+    await incrementUsage(keyDoc._id);
+    const data = response.data;
+    data.owner = "@aerivue";
+    if (data.result && typeof data.result === "object") data.result.owner = "@aerivue";
+    return res.json(data);
+  } catch (err) {
+    if (err.response) return res.status(err.response.status).json(err.response.data);
+    return res.status(500).json({ error: "Upstream Telegram API error" });
   }
 });
 
