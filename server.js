@@ -72,6 +72,16 @@ const API_REGISTRY = [
   description: "Aadhar card details lookup (multiple records)",
   icon: "🆔",
 },
+  {
+  type: "upi",
+  label: "UPI Lookup",
+  prefix: "upi_",
+  route: "/upi",
+  paramName: "upi",
+  envKey: "UPSTREAM_UPI_API_URL",
+  description: "UPI ID details lookup (account name, bank, IFSC)",
+  icon: "💳",
+},
 ];
 
 // ─── SCHEMAS ─────────────────────────────────────────────────────────────────
@@ -567,6 +577,184 @@ app.get("/aadhar/record", async (req, res) => {
     
   } catch (err) {
     return res.status(500).json({ error: "Upstream Aadhar API error" });
+  }
+});
+
+// ─── UPI API ROUTE ────────────────────────────────────────────────────────
+
+app.get("/upi", async (req, res) => {
+  const { upi } = req.query;
+  const apiKey = req.headers["x-api-key"] || req.query.apikey;
+  
+  // Input validation
+  if (!upi) return res.status(400).json({ error: "upi query param required (e.g., 8235633943@fam)" });
+  if (!apiKey) return res.status(401).json({ error: "API key required" });
+  
+  // Basic UPI ID validation (contains @)
+  if (!upi.includes('@')) {
+    return res.status(400).json({ error: "Invalid UPI ID format. Must contain @ (e.g., 8235633943@fam)" });
+  }
+  
+  // Validate API key for UPI type
+  const { error, status, keyDoc } = await validateApiKey(apiKey, "upi");
+  if (error) return res.status(status).json({ error });
+  
+  try {
+    // Upstream API call
+    const url = `${process.env.UPSTREAM_UPI_API_URL}?key=${process.env.UPI_API_KEY}&upi=${encodeURIComponent(upi)}`;
+    
+    console.log("Calling UPI API:", url.replace(process.env.UPI_API_KEY, "HIDDEN")); // Logging without exposing key
+    
+    const response = await axios.get(url, { 
+      timeout: 15000,
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'DEMON_KILLER-OSINT/1.0'
+      }
+    });
+    
+    // Increment usage count
+    await incrementUsage(keyDoc._id);
+    
+    // Get the data
+    let data = response.data;
+    
+    // Add owner branding (as per requirement - @aerivue)
+    data.owner = "@aerivue";
+    data.provider = "DEMON_KILLER-OSINT";
+    
+    // If original response had "by" field, replace it
+    if (data.by) {
+      data.original_by = data.by;
+      data.by = "@aerivue";
+    }
+    
+    // Add credit in primary/secondary if they exist
+    if (data.primary) {
+      data.primary.credit = "@aerivue";
+    }
+    if (data.secondary) {
+      data.secondary.credit = "@aerivue";
+      data.secondary.provider = "DEMON_KILLER";
+    }
+    
+    // Format response neatly
+    const formattedResponse = {
+      success: data.success || true,
+      upi_id: data.upi_id || upi,
+      valid: data.valid || data.primary?.validVpa || false,
+      account_name: data.account_name || data.primary?.recipientBankAccountName || data.secondary?.user_details?.name || null,
+      bank: data.bank || data.secondary?.bank_details?.bank || data.primary?.recipientBankAccountName ? "PhonePe Payments Bank" : null,
+      ifsc: data.ifsc || data.secondary?.user_details?.ifsc || data.primary?.recipientVpa ? "PPIW" : null,
+      psp: data.psp || (upi.includes('@') ? upi.split('@')[1] : null),
+      is_merchant: data.is_merchant || data.primary?.isMerchant || false,
+      details: {
+        primary: data.primary || null,
+        secondary: data.secondary || null
+      },
+      owner: "@aerivue",
+      timestamp: new Date().toISOString()
+    };
+    
+    // Remove null fields for cleaner response
+    Object.keys(formattedResponse).forEach(key => {
+      if (formattedResponse[key] === null || formattedResponse[key] === undefined) {
+        delete formattedResponse[key];
+      }
+    });
+    
+    return res.json(formattedResponse);
+    
+  } catch (err) {
+    console.error("UPI API Error:", err.message);
+    
+    // Handle specific error cases
+    if (err.code === 'ECONNABORTED') {
+      return res.status(504).json({ 
+        error: "UPI API timeout", 
+        message: "The upstream API took too long to respond",
+        owner: "@aerivue" 
+      });
+    }
+    
+    if (err.response) {
+      // Upstream API responded with error
+      const status = err.response.status;
+      const errorData = err.response.data;
+      
+      return res.status(status).json({ 
+        error: "UPI lookup failed",
+        upstream_error: errorData,
+        owner: "@aerivue"
+      });
+    }
+    
+    // Generic error
+    return res.status(500).json({ 
+      error: "UPI API error", 
+      details: err.message,
+      owner: "@aerivue"
+    });
+  }
+});
+
+// ─── UPI BULK LOOKUP (Optional - agar multiple UPI IDs check karne ho) ─────
+
+app.post("/upi/bulk", async (req, res) => {
+  const { upi_ids } = req.body; // Expecting array of UPI IDs
+  const apiKey = req.headers["x-api-key"] || req.query.apikey;
+  
+  if (!upi_ids || !Array.isArray(upi_ids)) {
+    return res.status(400).json({ error: "upi_ids array required in request body" });
+  }
+  
+  if (upi_ids.length > 10) {
+    return res.status(400).json({ error: "Maximum 10 UPI IDs allowed per bulk request" });
+  }
+  
+  if (!apiKey) return res.status(401).json({ error: "API key required" });
+  
+  const { error, status, keyDoc } = await validateApiKey(apiKey, "upi");
+  if (error) return res.status(status).json({ error });
+  
+  try {
+    const results = [];
+    
+    for (const upi of upi_ids) {
+      try {
+        const url = `${process.env.UPSTREAM_UPI_API_URL}?key=${process.env.UPI_API_KEY}&upi=${encodeURIComponent(upi)}`;
+        const response = await axios.get(url, { timeout: 10000 });
+        
+        results.push({
+          upi,
+          success: true,
+          data: response.data,
+          owner: "@aerivue"
+        });
+      } catch (err) {
+        results.push({
+          upi,
+          success: false,
+          error: err.message,
+          owner: "@aerivue"
+        });
+      }
+      
+      // Small delay to avoid rate limiting
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+    
+    await incrementUsage(keyDoc._id);
+    
+    return res.json({
+      success: true,
+      total: results.length,
+      results,
+      owner: "@aerivue"
+    });
+    
+  } catch (err) {
+    return res.status(500).json({ error: "Bulk UPI lookup failed", owner: "@aerivue" });
   }
 });
 
