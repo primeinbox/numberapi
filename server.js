@@ -62,6 +62,16 @@ const API_REGISTRY = [
     description: "Telegram user ID lookup",
     icon: "✈️",
   },
+  {
+  type: "aadhar",
+  label: "Aadhar Lookup",
+  prefix: "aad_",
+  route: "/aadhar",
+  paramName: "aadhar",
+  envKey: "UPSTREAM_AADHAR_API_URL",
+  description: "Aadhar card details lookup (multiple records)",
+  icon: "🆔",
+},
 ];
 
 // ─── SCHEMAS ─────────────────────────────────────────────────────────────────
@@ -467,6 +477,96 @@ app.get("/tg", async (req, res) => {
   } catch (err) {
     if (err.response) return res.status(err.response.status).json(err.response.data);
     return res.status(500).json({ error: "Upstream Telegram API error" });
+  }
+});
+
+// ─── AADHAR API ROUTE ────────────────────────────────────────────────────────
+
+app.get("/aadhar", async (req, res) => {
+  const { aadhar } = req.query;
+  const apiKey = req.headers["x-api-key"] || req.query.apikey;
+  
+  if (!aadhar) return res.status(400).json({ error: "aadhar query param required" });
+  if (!apiKey) return res.status(401).json({ error: "API key required" });
+  
+  // Aadhar number validation (basic: 12 digits)
+  if (!/^\d{12}$/.test(aadhar)) {
+    return res.status(400).json({ error: "Invalid Aadhar number. Must be 12 digits." });
+  }
+  
+  const { error, status, keyDoc } = await validateApiKey(apiKey, "aadhar");
+  if (error) return res.status(status).json({ error });
+  
+  try {
+    // Upstream API call with key
+    const url = `${process.env.UPSTREAM_AADHAR_API_URL}?key=${process.env.AADHAR_API_KEY}&addhar=${encodeURIComponent(aadhar)}`;
+    
+    const response = await axios.get(url, { timeout: 15000 });
+    
+    await incrementUsage(keyDoc._id);
+    
+    // Response ko modify kar ke owner add kar
+    let data = response.data;
+    
+    // Check karein ki response structure kya hai
+    if (data && data.results) {
+      data.results.developer = "@aerivue";  // Original developer tag replace kar diya
+      data.results.owner = "@aerivue";
+    }
+    
+    // Branding section agar hai toh update kar
+    if (data.branding) {
+      data.branding.owner = "@aerivue";
+      data.branding.server = "DEMON_KILLER-ENGINE";
+    }
+    
+    // Extra ownership mark
+    data.owner = "@aerivue";
+    data.api_provider = "DEMON_KILLER";
+    
+    return res.json(data);
+    
+  } catch (err) {
+    console.error("Aadhar API Error:", err.message);
+    if (err.response) {
+      // Upstream API ka error response forward kar de
+      return res.status(err.response.status).json(err.response.data);
+    }
+    return res.status(500).json({ error: "Upstream Aadhar API error", details: err.message });
+  }
+});
+
+// Optional: Aadhar bulk lookup ya specific record ke liye alag route (agar chahiye toh)
+app.get("/aadhar/record", async (req, res) => {
+  const { aadhar, index } = req.query;
+  const apiKey = req.headers["x-api-key"] || req.query.apikey;
+  
+  if (!aadhar || !index) return res.status(400).json({ error: "aadhar and index required" });
+  if (!apiKey) return res.status(401).json({ error: "API key required" });
+  
+  const { error, status, keyDoc } = await validateApiKey(apiKey, "aadhar");
+  if (error) return res.status(status).json({ error });
+  
+  try {
+    const url = `${process.env.UPSTREAM_AADHAR_API_URL}?key=${process.env.AADHAR_API_KEY}&addhar=${encodeURIComponent(aadhar)}`;
+    const response = await axios.get(url, { timeout: 15000 });
+    
+    await incrementUsage(keyDoc._id);
+    
+    const data = response.data;
+    
+    // Specific record nikaal kar de agar index valid hai
+    if (data.results && data.results.records && data.results.records[index]) {
+      const record = data.results.records[index];
+      record.owner = "@aerivue";
+      record.source_api = "DEMON_KILLER";
+      return res.json({ success: true, record });
+    } else {
+      return res.status(404).json({ error: "Record not found at specified index" });
+    }
+    
+  } catch (err) {
+    return res.status(500).json({ error: "Upstream Aadhar API error" });
   }
 });
 
