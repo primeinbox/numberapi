@@ -82,6 +82,16 @@ const API_REGISTRY = [
   description: "UPI ID details lookup (account name, bank, IFSC)",
   icon: "💳",
 },
+  {
+  type: "imei",
+  label: "IMEI Info",
+  prefix: "imei_",
+  route: "/imei",
+  paramName: "imei",
+  envKey: "UPSTREAM_IMEI_API_URL",
+  description: "IMEI number to phone details (brand, model, specs, etc.)",
+  icon: "📱",
+},
 ];
 
 // ─── SCHEMAS ─────────────────────────────────────────────────────────────────
@@ -757,6 +767,302 @@ app.post("/upi/bulk", async (req, res) => {
     return res.status(500).json({ error: "Bulk UPI lookup failed", owner: "@aerivue" });
   }
 });
+
+// ─── IMEI INFO API ROUTE ────────────────────────────────────────────────────
+
+app.get("/imei", async (req, res) => {
+  const { imei } = req.query;
+  const apiKey = req.headers["x-api-key"] || req.query.apikey;
+  
+  // Input validation
+  if (!imei) return res.status(400).json({ error: "imei query param required (e.g., 353010111111110)" });
+  if (!apiKey) return res.status(401).json({ error: "API key required" });
+  
+  // IMEI validation (15 digits)
+  if (!/^\d{15}$/.test(imei)) {
+    return res.status(400).json({ 
+      error: "Invalid IMEI number. Must be exactly 15 digits.",
+      example: "353010111111110"
+    });
+  }
+  
+  // Validate API key for IMEI type
+  const { error, status, keyDoc } = await validateApiKey(apiKey, "imei");
+  if (error) return res.status(status).json({ error });
+  
+  try {
+    // Upstream API call
+    const url = `${process.env.UPSTREAM_IMEI_API_URL}/?imei_num=${encodeURIComponent(imei)}`;
+    
+    console.log("Calling IMEI API:", url);
+    
+    const response = await axios.get(url, { 
+      timeout: 15000,
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'DEMON_KILLER-OSINT/1.0'
+      }
+    });
+    
+    // Increment usage count
+    await incrementUsage(keyDoc._id);
+    
+    // Get the data
+    let data = response.data;
+    
+    // Format the response nicely
+    if (data.result) {
+      const result = data.result;
+      const header = result.header || {};
+      const items = result.items || [];
+      
+      // Extract key information from items array
+      const specs = {};
+      items.forEach(item => {
+        if (item.role === 'item' && item.title && item.content) {
+          specs[item.title] = item.content;
+        }
+      });
+      
+      // Create formatted response
+      const formattedResponse = {
+        success: true,
+        imei: header.imei || imei,
+        brand: header.brand || "Unknown",
+        model: header.model || "Unknown",
+        photo: header.photo || null,
+        basic_info: {
+          code_name: specs["Code Name"] || null,
+          release_year: specs["Relase Year"] || specs["Release Year"] || null,
+          os: specs["Operating systems"] || null,
+          chipset: specs["Chipset"] || null,
+          gpu: specs["GPU type"] || null
+        },
+        dimensions: {
+          height: specs["Height"] || null,
+          width: specs["Width"] || null,
+          thickness: specs["Thickness"] || null
+        },
+        display: {
+          type: specs["Display type"] || null,
+          resolution: specs["Display"] || null,
+          size: specs["Diagonal"] || null
+        },
+        network: {
+          "5g": specs["5G"] === "True",
+          "4g": specs["4G"] === "True", 
+          "3g": specs["3G"] === "True",
+          "2g": specs["2G"] === "True"
+        },
+        battery: {
+          type: specs["Type"] || null,
+          capacity: specs["Capacity"] || null
+        },
+        camera: {
+          main: specs["Main"] || null,
+          selfie: specs["Selfie"] || null
+        },
+        full_specs: items,
+        owner: "@aerivue",
+        credit: "@aerivue",
+        timestamp: new Date().toISOString()
+      };
+      
+      // Remove null fields
+      Object.keys(formattedResponse).forEach(key => {
+        if (formattedResponse[key] === null || formattedResponse[key] === undefined) {
+          delete formattedResponse[key];
+        }
+      });
+      
+      return res.json(formattedResponse);
+    }
+    
+    // If structure is different, return original with owner tag
+    data.owner = "@aerivue";
+    data.credit = "@aerivue";
+    if (data.made_by) {
+      data.original_made_by = data.made_by;
+      data.made_by = "@aerivue";
+    }
+    
+    return res.json(data);
+    
+  } catch (err) {
+    console.error("IMEI API Error:", err.message);
+    
+    // Handle specific error cases
+    if (err.code === 'ECONNABORTED') {
+      return res.status(504).json({ 
+        error: "IMEI API timeout", 
+        message: "The upstream API took too long to respond",
+        owner: "@aerivue" 
+      });
+    }
+    
+    if (err.response) {
+      // Upstream API responded with error
+      const status = err.response.status;
+      const errorData = err.response.data;
+      
+      return res.status(status).json({ 
+        error: "IMEI lookup failed",
+        upstream_error: errorData,
+        owner: "@aerivue"
+      });
+    }
+    
+    // Generic error
+    return res.status(500).json({ 
+      error: "IMEI API error", 
+      details: err.message,
+      owner: "@aerivue"
+    });
+  }
+});
+
+// ─── IMEI BULK LOOKUP (Optional - multiple IMEIs ek saath) ─────────────────
+
+app.post("/imei/bulk", async (req, res) => {
+  const { imei_numbers } = req.body; // Expecting array of IMEI numbers
+  const apiKey = req.headers["x-api-key"] || req.query.apikey;
+  
+  if (!imei_numbers || !Array.isArray(imei_numbers)) {
+    return res.status(400).json({ error: "imei_numbers array required in request body" });
+  }
+  
+  if (imei_numbers.length > 5) {
+    return res.status(400).json({ error: "Maximum 5 IMEI numbers allowed per bulk request" });
+  }
+  
+  // Validate each IMEI
+  for (const imei of imei_numbers) {
+    if (!/^\d{15}$/.test(imei)) {
+      return res.status(400).json({ 
+        error: `Invalid IMEI format: ${imei}. Must be 15 digits.`
+      });
+    }
+  }
+  
+  if (!apiKey) return res.status(401).json({ error: "API key required" });
+  
+  const { error, status, keyDoc } = await validateApiKey(apiKey, "imei");
+  if (error) return res.status(status).json({ error });
+  
+  try {
+    const results = [];
+    
+    for (const imei of imei_numbers) {
+      try {
+        const url = `${process.env.UPSTREAM_IMEI_API_URL}/?imei_num=${encodeURIComponent(imei)}`;
+        const response = await axios.get(url, { timeout: 10000 });
+        
+        // Format each result
+        let resultData = response.data;
+        if (resultData.result) {
+          const header = resultData.result.header || {};
+          results.push({
+            imei,
+            success: true,
+            brand: header.brand || "Unknown",
+            model: header.model || "Unknown",
+            data: resultData,
+            owner: "@aerivue"
+          });
+        } else {
+          results.push({
+            imei,
+            success: true,
+            data: resultData,
+            owner: "@aerivue"
+          });
+        }
+      } catch (err) {
+        results.push({
+          imei,
+          success: false,
+          error: err.message,
+          owner: "@aerivue"
+        });
+      }
+      
+      // Small delay to avoid rate limiting
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+    
+    await incrementUsage(keyDoc._id);
+    
+    return res.json({
+      success: true,
+      total: results.length,
+      results,
+      owner: "@aerivue"
+    });
+    
+  } catch (err) {
+    return res.status(500).json({ error: "Bulk IMEI lookup failed", owner: "@aerivue" });
+  }
+});
+
+// ─── IMEI INFO - ALTERNATIVE ROUTE (Simple format) ───────────────────────
+
+app.get("/imei/simple", async (req, res) => {
+  const { imei } = req.query;
+  const apiKey = req.headers["x-api-key"] || req.query.apikey;
+  
+  if (!imei) return res.status(400).json({ error: "imei query param required" });
+  if (!apiKey) return res.status(401).json({ error: "API key required" });
+  if (!/^\d{15}$/.test(imei)) {
+    return res.status(400).json({ error: "Invalid IMEI. Must be 15 digits." });
+  }
+  
+  const { error, status, keyDoc } = await validateApiKey(apiKey, "imei");
+  if (error) return res.status(status).json({ error });
+  
+  try {
+    const url = `${process.env.UPSTREAM_IMEI_API_URL}/?imei_num=${encodeURIComponent(imei)}`;
+    const response = await axios.get(url, { timeout: 15000 });
+    
+    await incrementUsage(keyDoc._id);
+    
+    const data = response.data;
+    
+    if (data.result) {
+      const header = data.result.header || {};
+      const items = data.result.items || [];
+      
+      // Simple key-value format
+      const simpleInfo = {
+        imei: header.imei || imei,
+        brand: header.brand || "Unknown",
+        model: header.model || "Unknown",
+        photo: header.photo || null
+      };
+      
+      // Add all items as key-value
+      items.forEach(item => {
+        if (item.role === 'item' && item.title && item.content) {
+          simpleInfo[item.title.toLowerCase().replace(/ /g, '_')] = item.content;
+        }
+      });
+      
+      simpleInfo.owner = "@aerivue";
+      simpleInfo.credit = "@aerivue";
+      
+      return res.json(simpleInfo);
+    }
+    
+    return res.json({
+      imei,
+      error: "Could not parse IMEI info",
+      owner: "@aerivue"
+    });
+    
+  } catch (err) {
+    return res.status(500).json({ error: "IMEI lookup failed", owner: "@aerivue" });
+  }
+});
+
 
 app.get("/generate", async (req, res) => {
   const { prompt } = req.query;
