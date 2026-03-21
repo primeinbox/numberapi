@@ -726,7 +726,7 @@ app.get("/upi", async (req, res) => {
       owner: "@aerivue",
       credit: "@aerivue",
       timestamp: new Date().toISOString(),
-      note: "This is simulated data. For real UPI lookup, configure UPSTREAM_UPI_API_URL in .env"
+      note: "This is simulated data. For real UPI lookup"
     };
     
     return res.json(responseData);
