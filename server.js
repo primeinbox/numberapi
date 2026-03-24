@@ -92,6 +92,16 @@ const API_REGISTRY = [
   description: "IMEI number to phone details (brand, model, specs, etc.)",
   icon: "📱",
 },
+  {
+  type: "pan",
+  label: "PAN Lookup",
+  prefix: "pan_",
+  route: "/pan",
+  paramName: "pan",
+  envKey: "UPSTREAM_PAN_API_URL",
+  description: "PAN card details lookup",
+  icon: "🪪",
+},
 ];
 
 // ─── SCHEMAS ─────────────────────────────────────────────────────────────────
@@ -590,9 +600,80 @@ app.get("/aadhar/record", async (req, res) => {
   }
 });
 
-// ─── UPI API ROUTE ────────────────────────────────────────────────────────
+// ─── PAN API ROUTE ────────────────────────────────────────────────────────
 
-// ─── UPI API ROUTE (SELF-CONTAINED — No External API) ─────────────────────
+app.get("/pan", async (req, res) => {
+  const { pan } = req.query;
+  const apiKey = req.headers["x-api-key"] || req.query.apikey;
+
+  if (!pan) return res.status(400).json({ error: "pan query param required (e.g., ABCDE1234F)" });
+  if (!apiKey) return res.status(401).json({ error: "API key required" });
+
+  // PAN format validation: 5 letters + 4 digits + 1 letter
+  if (!/^[A-Z]{5}[0-9]{4}[A-Z]{1}$/.test(pan.toUpperCase())) {
+    return res.status(400).json({
+      error: "Invalid PAN format. Must be like ABCDE1234F",
+      example: "ABCDE1234F"
+    });
+  }
+
+  const { error, status, keyDoc } = await validateApiKey(apiKey, "pan");
+  if (error) return res.status(status).json({ error });
+
+  try {
+    const url = `${process.env.UPSTREAM_PAN_API_URL}?key=${process.env.PAN_API_KEY}&pan=${encodeURIComponent(pan.toUpperCase())}`;
+
+    const response = await axios.get(url, {
+      timeout: 15000,
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'DEMON_KILLER-OSINT/1.0'
+      }
+    });
+
+    await incrementUsage(keyDoc._id);
+
+    let data = response.data;
+
+    // Owner branding
+    data.owner = "@aerivue";
+    data.credit = "@aerivue";
+    data.api_provider = "DEMON_KILLER";
+
+    if (data.result && typeof data.result === "object") {
+      data.result.owner = "@aerivue";
+    }
+
+    return res.json(data);
+
+  } catch (err) {
+    console.error("PAN API Error:", err.message);
+
+    if (err.code === 'ECONNABORTED') {
+      return res.status(504).json({
+        error: "PAN API timeout",
+        message: "Upstream API took too long",
+        owner: "@aerivue"
+      });
+    }
+
+    if (err.response) {
+      return res.status(err.response.status).json({
+        error: "PAN lookup failed",
+        upstream_error: err.response.data,
+        owner: "@aerivue"
+      });
+    }
+
+    return res.status(500).json({
+      error: "Upstream PAN API error",
+      details: err.message,
+      owner: "@aerivue"
+    });
+  }
+});
+
+// ─── UPI API ROUTE ────────────────────────────────────────────────────────
 
 app.get("/upi", async (req, res) => {
   const { upi } = req.query;
