@@ -487,7 +487,7 @@ app.get("/tg", async (req, res) => {
   const { error, status, keyDoc } = await validateApiKey(apiKey, "telegram");
   if (error) return res.status(status).json({ error });
   try {
-    const url = `${process.env.UPSTREAM_TG_API_URL}?key=${process.env.TG_API_KEY}&type=tg&term=${encodeURIComponent(userid)}`;
+    const url = `${process.env.UPSTREAM_TG_API_URL}?key=${process.env.TG_API_KEY}&number=${encodeURIComponent(userid)}`;
     const response = await axios.get(url, { timeout: 10000 });
     await incrementUsage(keyDoc._id);
     const data = response.data;
