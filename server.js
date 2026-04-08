@@ -529,7 +529,7 @@ app.get("/aadhar", async (req, res) => {
   
   try {
     // Upstream API call with key
-    const url = `${process.env.UPSTREAM_AADHAR_API_URL}?key=${process.env.AADHAR_API_KEY}&addhar=${encodeURIComponent(aadhar)}`;
+    const url = `${process.env.UPSTREAM_AADHAR_API_URL}?key=${process.env.AADHAR_API_KEY}&num=${encodeURIComponent(aadhar)}`;
     
     const response = await axios.get(url, { timeout: 15000 });
     
