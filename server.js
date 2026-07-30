@@ -564,10 +564,12 @@ app.get("/aadhar", async (req, res) => {
     if (data.branding) {
       data.branding.owner = "@aerivue";
       data.branding.server = "DEMON_KILLER-ENGINE";
+
     }
     
     // Extra ownership mark
     data.owner = "@aerivue";
+    data.channel = "@kernelproto";
     data.api_provider = "DEMON_KILLER";
     
     return res.json(data);
